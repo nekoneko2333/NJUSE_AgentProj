@@ -1,5 +1,7 @@
 import asyncio
 import unittest
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 from app.agents.orchestrator import Orchestrator
 from app.core.settings import settings
@@ -16,6 +18,15 @@ class CoreTests(unittest.TestCase):
     def test_risky_command_is_blocked(self):
         tools = ToolRegistry(Workspace(r"C:\Desktop\NJUSE_AgentProj"))
         self.assertEqual(tools.run_command("rm -rf temp").code, "command_requires_approval")
+
+    def test_write_file_returns_unified_diff(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "note.txt"
+            target.write_text("before\n", encoding="utf-8")
+            result = ToolRegistry(Workspace(directory)).write_file("note.txt", "after\n")
+            self.assertTrue(result.ok)
+            self.assertIn("-before", result.meta["diff"])
+            self.assertIn("+after", result.meta["diff"])
 
     def test_orchestrator_runs_all_roles(self):
         async def exercise():

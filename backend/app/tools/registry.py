@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,8 @@ class ToolRegistry:
             target.parent.mkdir(parents=True, exist_ok=True)
             previous = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
             target.write_text(content, encoding="utf-8")
-            return ToolResult(True, "ok", "", {"path": str(target.relative_to(self.workspace.root)), "created": not bool(previous), "previous_bytes": len(previous.encode()), "new_bytes": len(content.encode())})
+            diff = "\n".join(difflib.unified_diff(previous.splitlines(), content.splitlines(), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""))[:MAX_OUTPUT]
+            return ToolResult(True, "ok", "", {"path": str(target.relative_to(self.workspace.root)), "created": not bool(previous), "previous_bytes": len(previous.encode()), "new_bytes": len(content.encode()), "diff": diff})
         except WorkspaceError as error:
             return ToolResult(False, str(error), "", {})
 
