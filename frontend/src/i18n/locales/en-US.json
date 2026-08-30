@@ -4,6 +4,7 @@
   "workspacePlaceholder": "For example: C:\\Desktop\\my-project", "start": "Start collaboration", "running": "Starting…",
   "timeline": "Collaboration timeline", "files": "Files", "terminal": "Terminal", "diff": "Changes", "welcome": "Ready to begin",
   "welcomeDetail": "Enter a task and workspace. Planner, Explorer, Coder, and Reviewer will collaborate in sequence.",
-  "language": "Language", "modelNotReady": "Demo orchestration is active. Real execution will be enabled with the model client.",
+  "language": "Language", "safeExecution": "A real run uses your locally configured model and is restricted to the chosen workspace; risky commands are blocked.", "eventCount": "{{count}} events",
+  "terminalWaiting": "waiting for a task…", "terminalConnected": "event stream connected", "events": { "task_created": "Task created", "agent_started": "Agent started", "agent_finished": "Agent finished its current phase", "tool_requested": "Requesting tool: {{tool}}", "tool_finished": "Tool completed: {{tool}}", "task_finished": "Task completed", "task_failed": "Task failed" },
   "roles": { "planner": "Planner", "explorer": "Explorer", "coder": "Coder", "reviewer": "Reviewer" }
 }

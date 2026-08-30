@@ -19,6 +19,7 @@ data/
 logs/
 tmp/
 *.log
+*.tsbuildinfo
 
 # IDE / OS
 .vscode/

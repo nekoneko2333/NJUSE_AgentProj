@@ -4,6 +4,7 @@
   "workspacePlaceholder": "例如：C:\\Desktop\\my-project", "start": "开始协作", "running": "正在启动…",
   "timeline": "协作时间线", "files": "文件", "terminal": "终端", "diff": "变更", "welcome": "准备开始",
   "welcomeDetail": "输入任务和工作区后，Planner、Explorer、Coder、Reviewer 将依次协作。",
-  "language": "语言", "modelNotReady": "当前为演示编排；真实执行将在模型调用模块接入后启用。",
+  "language": "语言", "safeExecution": "真实运行将调用你本地配置的模型，并仅能操作所选工作区；高风险命令会被拦截。", "eventCount": "{{count}} 条事件",
+  "terminalWaiting": "等待任务启动…", "terminalConnected": "事件流已连接", "events": { "task_created": "任务已创建", "agent_started": "角色已开始执行", "agent_finished": "角色已完成当前阶段", "tool_requested": "正在请求工具：{{tool}}", "tool_finished": "工具已完成：{{tool}}", "task_finished": "任务已完成", "task_failed": "任务执行失败" },
   "roles": { "planner": "规划者", "explorer": "探索者", "coder": "实现者", "reviewer": "审查者" }
 }
