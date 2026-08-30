@@ -21,9 +21,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 class Orchestrator:
-    def __init__(self, session_id: str, task: str, tools: ToolRegistry, client: OpenAICompatibleClient, settings: Settings, publish: Publish) -> None:
+    def __init__(self, session_id: str, task: str, tools: ToolRegistry, client: OpenAICompatibleClient, settings: Settings, publish: Publish, locale: str = "zh-CN") -> None:
         self.session_id, self.task, self.tools, self.client, self.settings, self.publish = session_id, task, tools, client, settings, publish
         self.history: list[dict[str, Any]] = []
+        self.locale = locale
 
     async def run(self) -> None:
         for role in (AgentRole.PLANNER, AgentRole.EXPLORER, AgentRole.CODER, AgentRole.REVIEWER):
@@ -33,7 +34,8 @@ class Orchestrator:
     async def _run_role(self, role: AgentRole) -> None:
         policy = ROLE_POLICY[role]
         await self.publish(AgentEvent(type=EventType.AGENT_STARTED, session_id=self.session_id, role=role, summary=policy["goal"]))
-        system = {"role": "system", "content": f"你是 MossCode 的 {role.value}。{policy['goal']} 用户任务：{self.task}。只调用授权工具；完成后用中文简短总结。"}
+        language = "English" if self.locale == "en-US" else "Chinese"
+        system = {"role": "system", "content": f"You are MossCode's {role.value} agent. {policy['goal']} User task: {self.task}. Only call permitted tools. Finish with a concise summary in {language}."}
         messages: list[dict[str, Any]] = [system, *self.history]
         permitted = [TOOL_SCHEMAS[name] for name in policy["tools"]]
         repeated_calls: dict[str, int] = {}
@@ -48,7 +50,7 @@ class Orchestrator:
             if not tool_calls:
                 summary = (assistant.get("content") or "角色未给出文字总结").strip()[:800]
                 self.history.extend(messages[1:])
-                await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary))
+                await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary}))
                 return
             for call in tool_calls:
                 name = call.get("function", {}).get("name", "")

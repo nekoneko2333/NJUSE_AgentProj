@@ -40,7 +40,7 @@ async def create_session(payload: CreateTaskRequest) -> SessionSnapshot:
         Workspace(payload.workspace)
     except WorkspaceError as error:
         raise HTTPException(422, detail=str(error)) from error
-    session = SessionSnapshot(id=str(uuid4()), task=payload.task, workspace=payload.workspace, status="created", events=[])
+    session = SessionSnapshot(id=str(uuid4()), task=payload.task, workspace=payload.workspace, locale=payload.locale, status="created", events=[])
     sessions[session.id] = session
     await publish(AgentEvent(type=EventType.TASK_CREATED, session_id=session.id, summary="任务已创建", payload={"locale": payload.locale}))
     return session
@@ -102,7 +102,7 @@ async def run_agent(session_id: str) -> dict[str, str]:
         raise HTTPException(409, detail="session_already_running")
     session.status = "running"
     client = OpenAICompatibleClient(api_key=settings.api_key, base_url=settings.base_url, model=settings.model)
-    runner = Orchestrator(session_id, session.task, ToolRegistry(Workspace(session.workspace), settings.command_timeout_seconds), client, settings, publish)
+    runner = Orchestrator(session_id, session.task, ToolRegistry(Workspace(session.workspace), settings.command_timeout_seconds), client, settings, publish, session.locale)
     try:
         await runner.run()
     except LLMError as error:

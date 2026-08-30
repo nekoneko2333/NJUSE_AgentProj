@@ -40,5 +40,6 @@ class SessionSnapshot(BaseModel):
     id: str
     task: str
     workspace: str
+    locale: str = "zh-CN"
     status: str
     events: list[AgentEvent]
