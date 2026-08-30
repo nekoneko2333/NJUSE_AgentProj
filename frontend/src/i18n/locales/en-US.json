@@ -1,0 +1,9 @@
+{
+  "appName": "MossCode", "tagline": "Visual multi-agent coding assistant", "newTask": "New task", "task": "Coding task",
+  "taskPlaceholder": "For example: add a health endpoint and its tests", "workspace": "Workspace path",
+  "workspacePlaceholder": "For example: C:\\Desktop\\my-project", "start": "Start collaboration", "running": "Starting…",
+  "timeline": "Collaboration timeline", "files": "Files", "terminal": "Terminal", "diff": "Changes", "welcome": "Ready to begin",
+  "welcomeDetail": "Enter a task and workspace. Planner, Explorer, Coder, and Reviewer will collaborate in sequence.",
+  "language": "Language", "modelNotReady": "Demo orchestration is active. Real execution will be enabled with the model client.",
+  "roles": { "planner": "Planner", "explorer": "Explorer", "coder": "Coder", "reviewer": "Reviewer" }
+}

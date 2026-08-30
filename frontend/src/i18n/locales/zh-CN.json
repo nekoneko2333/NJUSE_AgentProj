@@ -1,0 +1,9 @@
+{
+  "appName": "MossCode", "tagline": "可视化多智能体编程助手", "newTask": "新建任务", "task": "编程任务",
+  "taskPlaceholder": "例如：为当前项目新增一个健康检查接口并补齐测试", "workspace": "工作区路径",
+  "workspacePlaceholder": "例如：C:\\Desktop\\my-project", "start": "开始协作", "running": "正在启动…",
+  "timeline": "协作时间线", "files": "文件", "terminal": "终端", "diff": "变更", "welcome": "准备开始",
+  "welcomeDetail": "输入任务和工作区后，Planner、Explorer、Coder、Reviewer 将依次协作。",
+  "language": "语言", "modelNotReady": "当前为演示编排；真实执行将在模型调用模块接入后启用。",
+  "roles": { "planner": "规划者", "explorer": "探索者", "coder": "实现者", "reviewer": "审查者" }
+}
