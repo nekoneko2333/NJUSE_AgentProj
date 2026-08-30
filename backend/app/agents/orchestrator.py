@@ -36,6 +36,7 @@ class Orchestrator:
         system = {"role": "system", "content": f"你是 MossCode 的 {role.value}。{policy['goal']} 用户任务：{self.task}。只调用授权工具；完成后用中文简短总结。"}
         messages: list[dict[str, Any]] = [system, *self.history]
         permitted = [TOOL_SCHEMAS[name] for name in policy["tools"]]
+        repeated_calls: dict[str, int] = {}
         for _ in range(self.settings.max_turns // 3):
             try:
                 assistant = await self.client.complete(messages, permitted)
@@ -56,13 +57,18 @@ class Orchestrator:
                 except json.JSONDecodeError:
                     result = ToolResult(False, "invalid_tool_arguments", "", {})
                 else:
-                    await self.publish(AgentEvent(type=EventType.TOOL_REQUESTED, session_id=self.session_id, role=role, summary=f"请求工具：{name}", payload={"tool": name, "arguments": arguments}))
-                    result = self._execute(role, name, arguments)
+                    signature = f"{name}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
+                    repeated_calls[signature] = repeated_calls.get(signature, 0) + 1
+                    if repeated_calls[signature] > 2:
+                        result = ToolResult(False, "repeated_tool_call", "", {"tool": name})
+                    else:
+                        await self.publish(AgentEvent(type=EventType.TOOL_REQUESTED, session_id=self.session_id, role=role, summary=f"请求工具：{name}", payload={"tool": name, "arguments": arguments}))
+                        result = self._execute(role, name, arguments)
                 payload = {"ok": result.ok, "code": result.code, "content": result.content, "meta": result.meta}
                 await self.publish(AgentEvent(type=EventType.TOOL_FINISHED, session_id=self.session_id, role=role, summary=f"工具完成：{name}（{result.code}）", payload={"tool": name, "result": payload}))
                 messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": json.dumps(payload, ensure_ascii=False)})
-        await self.publish(AgentEvent(type=EventType.TASK_FAILED, session_id=self.session_id, role=role, summary="agent_turn_limit_reached"))
-        raise LLMError("agent_turn_limit_reached")
+        self.history.extend(messages[1:])
+        await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary="agent_turn_limit_reached"))
 
     def _execute(self, role: AgentRole, name: str, arguments: dict[str, Any]) -> ToolResult:
         if name not in ROLE_POLICY[role]["tools"] or not hasattr(self.tools, name):

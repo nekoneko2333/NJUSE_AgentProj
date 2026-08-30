@@ -14,6 +14,11 @@ class FakeClient:
         return {"role": "assistant", "content": "已完成"}
 
 
+class RepeatingToolClient:
+    async def complete(self, messages, tools):
+        return {"role": "assistant", "content": None, "tool_calls": [{"id": "loop", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]}
+
+
 class CoreTests(unittest.TestCase):
     def test_risky_command_is_blocked(self):
         tools = ToolRegistry(Workspace(r"C:\Desktop\NJUSE_AgentProj"))
@@ -42,6 +47,21 @@ class CoreTests(unittest.TestCase):
         events = asyncio.run(exercise())
         self.assertEqual(len(events), 9)
         self.assertEqual(events[-1].type, "task_finished")
+
+    def test_repeated_tool_calls_do_not_fail_entire_task(self):
+        async def exercise():
+            events = []
+
+            async def publish(event):
+                events.append(event)
+
+            tools = ToolRegistry(Workspace(r"C:\Desktop\NJUSE_AgentProj"))
+            await Orchestrator("test", "检查项目", tools, RepeatingToolClient(), settings, publish).run()
+            return events
+
+        events = asyncio.run(exercise())
+        self.assertEqual(events[-1].type, "task_finished")
+        self.assertTrue(any(event.payload.get("result", {}).get("code") == "repeated_tool_call" for event in events))
 
 
 if __name__ == "__main__":
