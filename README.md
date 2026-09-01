@@ -1,16 +1,295 @@
 # MossCode
 
-默认中文、可切换中英文的多智能体编程助手。项目独立实现模型调用、工具执行、上下文传递、状态机与终止控制，不依赖 agent 框架。
+MossCode 是一个面向本地软件工程任务的多智能体编程工作台。它以中文为默认语言，提供可切换的中英文界面，将任务规划、代码探索、文件修改、命令验证和结果审查串成一个可恢复、可审计的完整闭环。
 
-## 运行
+项目没有依赖现成 Agent 框架：对话历史与上下文管理、模型工具调用解析、本地工具执行、角色编排、循环终止、错误恢复、权限审批和完成判定均由项目自行实现。当前默认接入 DeepSeek，也兼容采用 OpenAI Chat Completions 协议的模型服务。
 
-1. 复制 `.env.example` 为 `.env`，填写 DeepSeek API key。
-2. 后端：`python -m pip install -r backend/requirements.txt`，然后在 PowerShell 项目根目录执行 `$env:PYTHONPATH='backend'; python -m uvicorn app.main:app --reload --port 8000`。
-3. 前端：`cd frontend && pnpm install && pnpm dev`，访问 `http://localhost:5173`。
+## 当前完成度
 
-输入任务与工作区后，Planner、Explorer、Coder、Reviewer 依次执行。真实运行会调用 `.env` 中指定模型；所有文件操作受工作区边界限制，高风险命令被拦截，重复工具调用会自动终止对应角色。真实 key 仅存于未提交的 `.env`。
+目前已经实现可实际运行的前后端系统，而非静态界面或一次性模型演示：
 
-## 验证
+- 四角色串行协作：Planner、Explorer、Coder、Reviewer 各司其职并拥有不同工具权限。
+- SQLite 持久化会话、轮次、事件、后台执行、审批和检查点索引，刷新或重启后可恢复。
+- 后台 Execution 状态机支持排队、执行、等待审批、取消、失败、重试和中断恢复。
+- Agent 可在用户指定的本机工作区中搜索、读取、修改文件并运行安全命令。
+- GUI 提供聊天、文件树、全文搜索、多标签编辑、Diff、检查点恢复、终端和设置面板。
+- 支持项目规则、生命周期 Hooks、本地 stdio MCP、模型参数和命令权限配置。
+- 默认中文，文案通过 i18n 资源管理，可切换英文；提供 light 与 dusk 两套主题。
+- 已建立后端单元测试、前端组件测试、TypeScript 检查、生产构建和 Playwright 全栈冒烟测试。
 
-`$env:PYTHONPATH='backend'; python -m unittest discover -s backend/tests -v`
-`cd frontend && pnpm build`
+## 主要特性
+
+### 多 Agent 编排
+
+| 角色 | 职责 | 默认工具能力 |
+| --- | --- | --- |
+| Planner | 理解需求、拆分步骤、定义验收条件 | 不调用本地工具 |
+| Explorer | 调查项目结构、定位实现和风险 | 文件列表、读取、全文搜索 |
+| Coder | 实施修改并运行必要验证 | 列表、读取、搜索、写入、命令执行 |
+| Reviewer | 独立检查改动与测试结果 | 列表、读取、搜索、命令执行 |
+
+角色的中间 JSON、工具参数和内部讨论不会直接倾倒给用户。聊天区以自然语言显示阶段性进度、已用时间和最终 Markdown 总结；详细工具记录保留在可折叠区域中，兼顾可读性与可追溯性。
+
+编排器还包含以下工程约束：
+
+- 解析原生 tool call 与兼容格式，统一校验工具参数。
+- 限制角色轮次、检查预算和重复工具调用，避免无限循环。
+- 在模型请求、工具调用和角色切换前检查取消信号。
+- Reviewer 使用明确的 `PASS` / `NEEDS_WORK` 结论；若模型遗漏结论，仅在“最后一次写入后已有成功验证、之后无失败验证且无明确反对意见”时使用结构化证据兜底。
+- 兜底完成会记录 `completion_source=structured_evidence`，不会伪装成 Reviewer 正常通过。
+
+### 持久对话与长上下文
+
+- 会话、用户轮次、Agent 事件和执行状态写入 `data/mosscode.db`。
+- 可从历史会话继续追问，而不是每次启动一个无记忆的任务。
+- 上下文采用“较早轮次持久摘要 + 最近若干轮 + 当前任务”的有界窗口。
+- 默认上下文预算约 12,000 字符，并在各角色工具循环中再次裁剪。
+- Agent 思考期间输入框仍可使用；新消息会持久化排队，在当前一轮边界处插入后续执行。
+
+### 后台执行、取消与重试
+
+创建任务后，后端立即返回 `execution_id`，实际执行由后台线程继续完成。Execution 使用统一状态：
+
+`queued → running → waiting_approval → succeeded / failed / cancelled / interrupted`
+
+前端通过 SSE 接收进度，刷新页面后会从数据库恢复最新状态。用户可以取消运行中的任务，失败轮次也可以从原任务重试；重试会保留当前文件，并创建新的改动边界。
+
+### 文件工作台
+
+- 递归文件树会展示工作区内的目录与文件。
+- 支持全文搜索、结果分组、行号定位和忽略目录。
+- 文件以多标签形式预览，支持代码、文本、Markdown 和 JSON。
+- 可直接编辑文本文件；保存前展示 unified diff。
+- 保存接口使用 `expected_sha256` 乐观锁，防止覆盖 Agent 或外部程序产生的新修改。
+- 大文件采用只读与截断提示，避免阻塞浏览器。
+- 变更按文件折叠，可复制、审阅并从检查点恢复。
+
+### 独立检查点
+
+每轮第一次修改某个文件前，系统会保存该文件的原始内容、存在状态和哈希。同轮后续写入不会覆盖原始快照。
+
+- 快照位于 Git 忽略的 `data/checkpoints`，数据库仅保存索引和元数据。
+- 恢复前比较当前哈希与 Agent 写入后的哈希。
+- 检测到用户或外部程序的后续修改时返回冲突，不强制覆盖。
+- 恢复必须由用户显式确认，并记录 `checkpoint_restored` 审计事件。
+
+### 本地工具与权限
+
+命令执行支持三种模式：
+
+- 自动执行安全命令。
+- 每次询问并等待单次授权。
+- 禁止执行命令。
+
+所有文件路径都必须落在选定工作区中；高风险命令由底层规则直接拦截，不会因为用户批准而绕过。取消执行时，后端会终止对应命令的精确子进程树。
+
+### 项目规则、Hooks 与 MCP
+
+- 自动加载工作区根目录 `AGENTS.md` 和 `.mosscode/rules/*.md`，按文件名稳定排序并限制总长度。
+- GUI 可查看本轮实际加载的规则来源；默认不允许 Agent 修改规则文件。
+- `.mosscode/hooks.json` 可配置 `before_tool`、`after_tool`、`after_write`、`before_finish` 生命周期命令，默认关闭，启用后仍受工作区、超时和审批规则约束。
+- `.mosscode/mcp.json` 支持本地 stdio JSON-RPC、`tools/list` 和 `tools/call`。
+- MCP 工具采用 `server/tool` 命名空间，可按角色配置白名单；写入型 MCP 工具必须审批。
+
+当前 MCP 首版聚焦可信的本地进程，尚未支持远程 OAuth MCP。
+
+### GUI 与交互
+
+- 默认中文，基于 i18next 管理中英文资源，业务组件不依赖整段硬编码文案。
+- light 与 dusk 主题共用语义化 design token；颜色、边框、阴影、圆角、动效和滚动条均集中定义，便于增加自定义主题。
+- 视觉遵循 `style/prompt.xml` 的有机、克制风格，该文件本身保持不变。
+- Markdown 使用 GFM 渲染，支持标题、列表、表格、代码块和链接。
+- 聊天、文件树、Diff、终端与编辑器使用统一的极简滚动条，并移除 Windows 原生箭头按钮。
+- 对话右侧提供类似 Gemini 的用户发言导航轨道，可点击标记跳转到指定问题，并突出当前阅读轮次。
+- 仅在用户处于底部时自动跟随新消息；向上阅读时保留位置并提示“有新进度”。
+- 布局针对 1440×900、900×800 和 390×844 三类尺寸适配，窄屏下工作台可独立切换。
+- 本机单用户登录使用 HttpOnly Cookie；支持登录、退出和主题切换。
+
+## 技术栈
+
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | React、TypeScript、Vite |
+| UI 与内容 | CSS Design Tokens、Lucide React、react-markdown、remark-gfm |
+| 国际化 | i18next、react-i18next |
+| 后端 | Python、FastAPI、Uvicorn、HTTPX |
+| 模型接入 | OpenAI-compatible Chat Completions / tool calling，默认 DeepSeek |
+| 实时通信 | Server-Sent Events（SSE） |
+| 持久化 | SQLite（Python 标准库），文件系统检查点 |
+| 前端测试 | Vitest、Testing Library、User Event、jsdom |
+| 全栈测试 | Playwright、内置 demo 模型，不访问真实 API Key |
+| 后端测试 | Python unittest |
+
+## 系统架构
+
+```text
+React GUI
+├── 对话与 Markdown / 进度 / 审批
+├── 文件树 / 搜索 / 编辑 / Diff / 检查点
+└── 会话 / 设置 / 规则 / 主题 / i18n
+                 │ REST + SSE
+                 ▼
+FastAPI Backend
+├── Auth 与 Session API
+├── SQLite Store 与 Context Manager
+├── Background Execution 状态机
+├── Multi-Agent Orchestrator
+│   ├── Planner
+│   ├── Explorer
+│   ├── Coder
+│   └── Reviewer
+├── Tool Registry / Approval / Hooks / MCP
+└── Workspace Guard / Checkpoint Manager
+                 │
+                 ├── OpenAI-compatible LLM（DeepSeek）
+                 └── 用户选择的本机工作区
+```
+
+一次任务的主要流程为：
+
+1. 用户选择工作区并发送任务，后端创建持久化 Execution。
+2. 上下文管理器组合会话摘要、近期轮次、项目规则和当前输入。
+3. 四个角色依次工作；工具调用先经过角色白名单、路径边界和命令安全检查。
+4. 文件首次写入前创建检查点，写入和命令结果持续记录为事件并通过 SSE 推送。
+5. Reviewer 给出结论，编排器依据结论或严格的结构化证据终止循环。
+6. 前端输出一条统一的 Markdown 总结，并提供 Diff、日志和恢复入口。
+
+## 目录结构
+
+```text
+NJUSE_AgentProj/
+├── backend/
+│   ├── app/
+│   │   ├── agents/          # 四角色定义与编排器
+│   │   ├── core/            # 认证、上下文、检查点、扩展与配置
+│   │   ├── llm/             # OpenAI-compatible 模型客户端
+│   │   ├── storage/         # SQLite 持久化
+│   │   ├── tools/           # 本地文件、搜索、写入和命令工具
+│   │   └── main.py          # FastAPI 接口与后台执行
+│   └── tests/
+├── frontend/
+│   ├── src/                 # React 界面、工作台、设置与国际化资源
+│   ├── e2e/                 # Playwright 冒烟测试
+│   └── playwright.config.ts
+├── docs/                    # 项目计划书与总结报告
+├── style/prompt.xml         # 原始视觉规范，仅作为设计依据
+├── data/                    # 本地数据库与检查点，Git 忽略
+└── .env.example             # 无密钥的配置模板
+```
+
+## 本地运行
+
+### 1. 环境要求
+
+- Windows 10/11（当前主要测试平台）
+- Conda 环境 `web3d-backend`，建议 Python 3.11+
+- Node.js 与 pnpm
+- DeepSeek 或其他 OpenAI-compatible 服务的 API Key
+
+### 2. 配置后端
+
+在项目根目录复制 `.env.example` 为 `.env`，填写本机配置：
+
+```dotenv
+LLM_API_KEY=你的密钥
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-flash
+
+APP_USERNAME=moss
+APP_PASSWORD=请修改为自己的密码
+APPROVAL_TIMEOUT_SECONDS=180
+
+# 留空时在 GUI 中为每个任务选择工作区
+DEFAULT_WORKSPACE=
+```
+
+`.env` 已被 Git 忽略。API Key 只由本机后端读取，设置接口仅返回“是否已配置”，不会返回密钥原文，也不会把登录密码加入模型上下文。
+
+### 3. 启动后端
+
+```powershell
+conda activate web3d-backend
+pip install -r backend/requirements.txt
+cd backend
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+### 4. 启动前端
+
+另开终端：
+
+```powershell
+cd frontend
+pnpm install
+pnpm dev
+```
+
+访问 `http://127.0.0.1:5173`。前后端应使用相同的主机名形式（都使用 `127.0.0.1` 或都使用 `localhost`），以保证本机登录 Cookie 正常工作。
+
+登录账号和密码来自 `.env` 的 `APP_USERNAME` 与 `APP_PASSWORD`。服务重启后内存中的登录会话失效，需要重新登录。
+
+## 关键接口
+
+| 能力 | 接口示例 |
+| --- | --- |
+| 创建后台任务 | `POST /api/sessions/{id}/executions` |
+| 查询与取消执行 | `GET /api/executions/{id}`、`POST /api/executions/{id}/cancel` |
+| 重试轮次 | `POST /api/turns/{id}/retry` |
+| 读取与安全保存文件 | `GET /api/sessions/{id}/files/content`、`PUT /api/sessions/{id}/files/content` |
+| 工作区全文搜索 | `GET /api/sessions/{id}/search` |
+| 查询与恢复检查点 | `GET /api/sessions/{id}/checkpoints`、`POST /api/checkpoints/{id}/restore` |
+| 实时事件 | Session / Execution SSE 事件流 |
+
+## 测试与验收
+
+后端测试：
+
+```powershell
+cd backend
+conda run -n web3d-backend python -m unittest discover -s tests -v
+```
+
+前端组件测试、类型检查和生产构建：
+
+```powershell
+cd frontend
+pnpm test
+pnpm lint
+pnpm build
+```
+
+全栈冒烟测试：
+
+```powershell
+cd frontend
+pnpm test:e2e
+```
+
+当前验收基线：后端 28 项测试、前端 2 个组件测试文件、1 条 Playwright 全栈流程，以及 TypeScript 检查和生产构建全部通过。自动化测试使用临时数据库与 demo 模型，不读取真实 API Key，不修改 `style/prompt.xml`，也不会操作测试工作区以外的文件。
+
+## 安全边界
+
+- 工作区路径必须由用户选择或由 `DEFAULT_WORKSPACE` 明确配置。
+- 文件工具拒绝越过工作区边界的路径。
+- 高风险命令保持硬拦截，审批只适用于允许询问的命令。
+- 直接编辑采用内容哈希并发保护，恢复检查点同样进行冲突检测。
+- `.env`、数据库、检查点、测试产物和本机缓存均不提交到 Git。
+- Hooks 与 MCP 默认关闭，开启后仍经过角色权限和执行安全层。
+
+## 后续方向
+
+当前版本已经形成完整的本地 AgentCode 闭环，后续可继续向以下竞品级能力演进：
+
+1. 使用 Git worktree 隔离并行任务，并支持多方案对比。
+2. 动态 Agent 配置、按角色选模型和只读并行 Explorer。
+3. Skills / 插件包、MCP 管理界面和本地工具市场。
+4. GitHub Issue、Pull Request、CI、CodeQL 与 secret scanning 集成。
+5. 云端后台执行、移动端查看和本地/云端任务交接。
+6. Token、费用、上下文压缩率和 Agent 质量评测面板。
+
+## 文档
+
+- [项目计划书](docs/项目计划书.md)
+- [总结报告](docs/总结报告.md)
+
+本项目用于南京大学软件学院 2027 年预推免项目作业展示。

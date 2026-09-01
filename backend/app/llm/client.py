@@ -19,7 +19,9 @@ class OpenAICompatibleClient:
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.api_key:
             raise LLMError("llm_api_key_missing")
-        payload = {"model": self.model, "messages": messages, "tools": tools, "tool_choice": "auto", "temperature": 0.2}
+        payload: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0.2}
+        if tools:
+            payload.update({"tools": tools, "tool_choice": "auto"})
         try:
             async with httpx.AsyncClient(timeout=75) as client:
                 response = await client.post(f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload)

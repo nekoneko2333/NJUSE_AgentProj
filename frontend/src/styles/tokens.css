@@ -7,4 +7,20 @@
   --color-accent: var(--palette-clay-500); --color-danger: var(--palette-sienna-600); --color-success: #4f765d;
   --agent-planner: #657a70; --agent-explorer: #6e8194; --agent-coder: #bb8054; --agent-reviewer: #88739d;
   --radius-card: 2rem; --shadow-soft: 0 4px 20px -2px rgb(93 112 82 / 15%); --shadow-float: 0 10px 40px -10px rgb(193 140 93 / 20%);
+  --color-panel: rgb(254 254 250 / 86%); --color-panel-soft: rgb(250 249 244 / 78%); --color-input: rgb(255 255 252 / 92%);
+  --color-code: #303a2c; --color-code-text: #dfe8dc;
+  --scrollbar-size:6px; --scrollbar-track:transparent; --scrollbar-thumb:rgb(44 44 36 / 16%); --scrollbar-thumb-hover:rgb(44 44 36 / 32%); --scrollbar-thumb-active:rgb(44 44 36 / 46%);
+}
+
+:root[data-theme='dusk'] {
+  color-scheme: dark;
+  --palette-paper-50:#1d211b; --palette-paper-100:#292f26; --palette-loam-900:#edf0e7;
+  --palette-moss-600:#a5b990; --palette-clay-500:#d3a172; --palette-sand-200:#454b3f;
+  --palette-stone-300:#485044; --palette-grass-500:#aeb5a5; --palette-sienna-600:#dc8c7f;
+  --color-bg:#1d211b; --color-surface:#272d25; --color-text:#edf0e7; --color-muted:#aeb5a5;
+  --color-border:#485044; --color-primary:#a5b990; --color-accent:#d3a172; --color-danger:#dc8c7f; --color-success:#8eb79a;
+  --color-panel:rgb(39 45 37 / 88%); --color-panel-soft:rgb(34 40 32 / 82%); --color-input:rgb(44 51 41 / 94%);
+  --color-code:#151914; --color-code-text:#dfe8dc;
+  --scrollbar-track:transparent; --scrollbar-thumb:rgb(237 240 231 / 15%); --scrollbar-thumb-hover:rgb(237 240 231 / 30%); --scrollbar-thumb-active:rgb(237 240 231 / 44%);
+  --shadow-soft:0 7px 26px -7px rgb(5 9 4 / 48%); --shadow-float:0 18px 46px -16px rgb(0 0 0 / 55%);
 }

@@ -3,14 +3,33 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "lint": "tsc -b --noEmit" },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "i18next": "latest",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "react-i18next": "latest"
+    "react-i18next": "latest",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
-  "devDependencies": { "@types/react": "latest", "@types/react-dom": "latest", "typescript": "latest", "vite": "latest" }
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.6",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "jsdom": "^30.0.1",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "^4.1.11"
+  }
 }
