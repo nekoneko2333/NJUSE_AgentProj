@@ -155,11 +155,13 @@ class MCPManager:
         return discovered
 
     def schemas_for(self, role: AgentRole) -> list[dict[str, Any]]:
-        return [{"type": "function", "function": {"name": qualified, "description": tool["description"], "parameters": tool["inputSchema"]}} for qualified, tool in self.discover().items() if role.value in tool["roles"]]
+        role_names = {role.value, "coder"} if role is AgentRole.SINGLE else {role.value}
+        return [{"type": "function", "function": {"name": qualified, "description": tool["description"], "parameters": tool["inputSchema"]}} for qualified, tool in self.discover().items() if role_names.intersection(tool["roles"])]
 
     def call(self, qualified_name: str, arguments: dict[str, Any], role: AgentRole) -> tuple[bool, str, dict[str, Any]]:
         tool = self.discover().get(qualified_name)
-        if tool is None or role.value not in tool["roles"]:
+        role_names = {role.value, "coder"} if role is AgentRole.SINGLE else {role.value}
+        if tool is None or not role_names.intersection(tool["roles"]):
             return False, "mcp_tool_not_permitted", {}
         try:
             result = self._request(tool["server"], "tools/call", {"name": tool["name"], "arguments": arguments})

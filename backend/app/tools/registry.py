@@ -115,14 +115,18 @@ class ToolRegistry:
             return ToolResult(False, "empty_query", "", {})
         try:
             root = self.workspace.resolve(path)
+            if not root.exists():
+                return ToolResult(False, "path_not_found", "", {})
             matches: list[dict[str, Any]] = []
-            for candidate in root.rglob("*"):
-                if any(part in SKIP_NAMES for part in candidate.parts) or not candidate.is_file() or candidate.stat().st_size > MAX_FILE_BYTES:
+            candidates = [root] if root.is_file() else root.rglob("*")
+            for candidate in candidates:
+                relative = candidate.relative_to(self.workspace.root)
+                if any(part in SKIP_NAMES for part in relative.parts) or not candidate.is_file() or candidate.stat().st_size > MAX_FILE_BYTES:
                     continue
                 try:
                     for line_number, line in enumerate(candidate.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
                         if query.lower() in line.lower():
-                            matches.append({"path": str(candidate.relative_to(self.workspace.root)), "line": line_number, "text": line[:300]})
+                            matches.append({"path": relative.as_posix(), "line": line_number, "text": line[:300]})
                             if len(matches) >= 80:
                                 return ToolResult(True, "ok", "", {"matches": matches, "truncated": True})
                 except OSError:

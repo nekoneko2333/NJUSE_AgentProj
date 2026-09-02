@@ -1,7 +1,7 @@
 :root {
-  --palette-paper-50: #fdfcf8; --palette-paper-100: #f3f0e9; --palette-loam-900: #2c2c24;
+  --palette-paper-50: #fdfcf8; --palette-paper-100: #f3f0e9; --palette-loam-900: #22251f;
   --palette-moss-600: #5d7052; --palette-clay-500: #c18c5d; --palette-sand-200: #e6dccd;
-  --palette-stone-300: #ded8cf; --palette-grass-500: #78786c; --palette-sienna-600: #a85448;
+  --palette-stone-300: #d2ccc2; --palette-grass-500: #5f645a; --palette-sienna-600: #98463d;
   --color-bg: var(--palette-paper-50); --color-surface: #fefefa; --color-text: var(--palette-loam-900);
   --color-muted: var(--palette-grass-500); --color-border: var(--palette-stone-300); --color-primary: var(--palette-moss-600);
   --color-accent: var(--palette-clay-500); --color-danger: var(--palette-sienna-600); --color-success: #4f765d;
@@ -14,11 +14,11 @@
 
 :root[data-theme='dusk'] {
   color-scheme: dark;
-  --palette-paper-50:#1d211b; --palette-paper-100:#292f26; --palette-loam-900:#edf0e7;
+  --palette-paper-50:#1b1f19; --palette-paper-100:#282e25; --palette-loam-900:#f4f6ef;
   --palette-moss-600:#a5b990; --palette-clay-500:#d3a172; --palette-sand-200:#454b3f;
-  --palette-stone-300:#485044; --palette-grass-500:#aeb5a5; --palette-sienna-600:#dc8c7f;
-  --color-bg:#1d211b; --color-surface:#272d25; --color-text:#edf0e7; --color-muted:#aeb5a5;
-  --color-border:#485044; --color-primary:#a5b990; --color-accent:#d3a172; --color-danger:#dc8c7f; --color-success:#8eb79a;
+  --palette-stone-300:#596354; --palette-grass-500:#c5cbbf; --palette-sienna-600:#ef9a8d;
+  --color-bg:#1b1f19; --color-surface:#272d25; --color-text:#f4f6ef; --color-muted:#c5cbbf;
+  --color-border:#596354; --color-primary:#b6c9a2; --color-accent:#e0ad7d; --color-danger:#ef9a8d; --color-success:#9fc5a9;
   --color-panel:rgb(39 45 37 / 88%); --color-panel-soft:rgb(34 40 32 / 82%); --color-input:rgb(44 51 41 / 94%);
   --color-code:#151914; --color-code-text:#dfe8dc;
   --scrollbar-track:transparent; --scrollbar-thumb:rgb(237 240 231 / 15%); --scrollbar-thumb-hover:rgb(237 240 231 / 30%); --scrollbar-thumb-active:rgb(237 240 231 / 44%);

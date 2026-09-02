@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class AgentRole(StrEnum):
+    SINGLE = "single"
     PLANNER = "planner"
     EXPLORER = "explorer"
     CODER = "coder"
@@ -41,6 +42,9 @@ class CreateTaskRequest(BaseModel):
     workspace: str = Field(min_length=1, max_length=1024)
     locale: str = "zh-CN"
     command_mode: Literal["auto", "ask", "deny"] = "auto"
+    cross_session_memory_enabled: bool = False
+    agent_mode: Literal["multi", "single", "adaptive"] = "multi"
+    agent_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class AppendTurnRequest(BaseModel):
@@ -50,6 +54,21 @@ class AppendTurnRequest(BaseModel):
 
 class UpdateCommandModeRequest(BaseModel):
     command_mode: Literal["auto", "ask", "deny"]
+
+
+class UpdateCrossSessionMemoryRequest(BaseModel):
+    enabled: bool
+
+
+class UpdateAgentWorkflowRequest(BaseModel):
+    agent_mode: Literal["multi", "single", "adaptive"]
+    agent_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectConfigWriteRequest(BaseModel):
+    kind: Literal["agents", "hooks", "mcp"]
+    content: str = Field(max_length=100_000)
+    expected_sha256: str = Field(default="", max_length=64)
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -115,6 +134,8 @@ class SessionListItem(BaseModel):
     updated_at: str
     turn_count: int
     command_mode: Literal["auto", "ask", "deny"] = "auto"
+    cross_session_memory_enabled: bool = False
+    agent_mode: Literal["multi", "single", "adaptive"] = "multi"
 
 
 class SessionSnapshot(BaseModel):
@@ -130,3 +151,6 @@ class SessionSnapshot(BaseModel):
     turns: list[ConversationTurn] = Field(default_factory=list)
     events: list[AgentEvent]
     command_mode: Literal["auto", "ask", "deny"] = "auto"
+    cross_session_memory_enabled: bool = False
+    agent_mode: Literal["multi", "single", "adaptive"] = "multi"
+    agent_config: dict[str, Any] = Field(default_factory=dict)

@@ -26,20 +26,25 @@ class ContextManager:
         clean = " ".join(text.split())
         return clean if len(clean) <= limit else clean[: limit - 1] + "…"
 
-    def build(self, turns: list[ConversationTurn]) -> ContextWindow:
-        completed = [turn for turn in turns if turn.status == "finished"]
-        older, recent = completed[:-self.recent_turns], completed[-self.recent_turns:]
+    def build(self, turns: list[ConversationTurn], shared_memory: str = "", shared_preferences: str = "") -> ContextWindow:
+        # 失败、取消和中断的轮次仍包含用户原始要求；丢弃它们会让“重试/继续”失去指代对象。
+        terminal = [turn for turn in turns if turn.status in {"finished", "failed", "cancelled", "interrupted"}]
+        older, recent = terminal[:-self.recent_turns], terminal[-self.recent_turns:]
         summary_lines = [
-            f"第{turn.position}轮 用户：{self._clip(turn.user_content, 280)} 结果：{self._clip(turn.assistant_summary, 520)}"
+            f"第{turn.position}轮（{turn.status}） 用户：{self._clip(turn.user_content, 280)} 结果：{self._clip(turn.assistant_summary, 520)}"
             for turn in older
         ]
         memory_summary = self._clip("\n".join(summary_lines), self.summary_chars) if summary_lines else ""
         sections: list[str] = []
+        if shared_preferences.strip():
+            sections.append("同一工作区的实时用户偏好（用户已授权；按新到旧排列，每类第一条是当前值并覆盖旧对话中的冲突内容；除非当前要求再次更新，否则必须遵循）：\n" + self._clip(shared_preferences, min(1800, self.summary_chars)))
+        if shared_memory.strip():
+            sections.append("同一工作区的其他对话记忆（用户已授权，仅作参考）：\n" + self._clip(shared_memory, min(3200, self.summary_chars)))
         if memory_summary:
             sections.append("较早对话摘要：\n" + memory_summary)
         if recent:
             recent_lines = [
-                f"第{turn.position}轮\n用户：{self._clip(turn.user_content, 900)}\n结果：{self._clip(turn.assistant_summary, 1400)}"
+                f"第{turn.position}轮（{turn.status}）\n用户：{self._clip(turn.user_content, 900)}\n结果：{self._clip(turn.assistant_summary, 1400)}"
                 for turn in recent
             ]
             sections.append("最近对话：\n" + "\n\n".join(recent_lines))

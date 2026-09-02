@@ -2,13 +2,15 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDown, Bot, Check, ChevronRight, CircleAlert, CircleCheck, CircleX, Code2, FileText, Folder, FolderTree, GitBranch, KeyRound, LoaderCircle, LogOut, MessageSquareText, Moon, Play, Plus, Redo2, Settings2, ShieldCheck, Sparkles, Square, Sun, TerminalSquare, UserRound } from 'lucide-react'
-import { appendTurn, cancelExecution, createSession, getAuthStatus, getExecution, getLatestExecution, getSession, getWorkspaceFiles, listSessions, login, logout, resolveApproval, retryTurn, runAgent, setCommandMode, subscribe, type AgentEvent, type CommandMode, type SessionListItem, type WorkspaceEntry } from './api'
+import { ArrowDown, Bot, Check, ChevronRight, CircleAlert, CircleCheck, CircleX, Code2, FileText, Folder, FolderTree, GitBranch, KeyRound, LoaderCircle, LogOut, MessageSquareText, Moon, Play, Plus, Redo2, Settings2, ShieldCheck, Sparkles, Square, Sun, TerminalSquare, UserRound, X } from 'lucide-react'
+import { appendTurn, cancelExecution, createSession, DEFAULT_AGENT_WORKFLOW, getAuthStatus, getExecution, getLatestExecution, getSession, getWorkspaceFiles, listSessions, login, logout, resolveApproval, retryTurn, runAgent, setAgentWorkflow, setCommandMode, setCrossSessionMemory, subscribe, type AgentEvent, type AgentRoleName, type AgentWorkflow, type CommandMode, type Session, type SessionListItem, type WorkspaceEntry } from './api'
 import { FileWorkbench } from './FileWorkbench'
+import { SelectMenu } from './SelectMenu'
 import { SettingsPanel } from './SettingsPanel'
+import { SideBySideDiff } from './SideBySideDiff'
 import './styles/app.css'
 
-type Tab = 'files' | 'diff' | 'terminal' | 'settings'
+type Tab = 'files' | 'diff' | 'terminal'
 type Theme = 'light' | 'dusk'
 type ToolResult = { ok?: boolean; code?: string; content?: string; meta?: Record<string, unknown> }
 type TreeNode = { name: string; path: string; kind: 'file' | 'directory'; children: TreeNode[] }
@@ -18,6 +20,41 @@ type ConversationMarker = { id: string; label: string; top: number }
 const normalizePath = (value: string) => value.trim().replace(/[\\/]+$/, '').toLowerCase()
 const formatElapsed = (seconds: number) => seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`
 const appendUniqueEvent = (current: AgentEvent[], event: AgentEvent) => current.some((item) => item.type === event.type && item.turn_id === event.turn_id && item.role === event.role && item.summary === event.summary && JSON.stringify(item.payload) === JSON.stringify(event.payload)) ? current : [...current, event]
+const terminalEventTypes = new Set(['task_finished', 'task_failed', 'task_cancelled'])
+
+export function selectDisplayEvents(events: AgentEvent[]) {
+  const terminalIndexes = new Map<string, number[]>()
+  const latestMilestones = new Map<string, number>()
+  const latestAttemptStarts = new Map<string, number>()
+  events.forEach((event, index) => {
+    const turnKey = event.turn_id ?? 'session'
+    if (terminalEventTypes.has(event.type)) terminalIndexes.set(turnKey, [...(terminalIndexes.get(turnKey) ?? []), index])
+    if (event.type === 'agent_started') latestAttemptStarts.set(turnKey, index)
+    if (event.type !== 'tool_finished') return
+    const tool = String(event.payload.tool ?? '')
+    if (tool === 'write_file' || tool === 'run_command') latestMilestones.set(`${turnKey}:${tool}`, index)
+  })
+  return events.map((event, sourceIndex) => ({ event, sourceIndex })).filter(({ event, sourceIndex }) => {
+    const turnKey = event.turn_id ?? 'session'
+    const terminals = terminalIndexes.get(turnKey) ?? []
+    const latestTerminal = terminals.at(-1)
+    const previousTerminal = terminals.at(-2) ?? -1
+    const latestAttemptStart = latestAttemptStarts.get(turnKey) ?? -1
+    const previousAttemptBoundary = latestTerminal !== undefined && latestAttemptStart > latestTerminal ? latestTerminal : previousTerminal
+    if (event.type === 'task_created') return true
+    if (terminalEventTypes.has(event.type)) return sourceIndex === latestTerminal && latestAttemptStart <= sourceIndex
+    if (sourceIndex <= previousAttemptBoundary) return false
+    if (event.type === 'agent_started' || event.type === 'approval_requested' || event.type === 'approval_resolved') return true
+    if (event.type !== 'tool_finished') return false
+    const tool = String(event.payload.tool ?? '')
+    if (tool !== 'write_file' && tool !== 'run_command') return false
+    return latestMilestones.get(`${turnKey}:${tool}`) === sourceIndex
+  })
+}
+const normalizeWorkflow = (session?: Pick<Session, 'agent_mode' | 'agent_config'>): AgentWorkflow => ({
+  agent_mode:session?.agent_mode ?? DEFAULT_AGENT_WORKFLOW.agent_mode,
+  agent_config:Object.fromEntries((Object.keys(DEFAULT_AGENT_WORKFLOW.agent_config) as AgentRoleName[]).map((role) => [role, { ...DEFAULT_AGENT_WORKFLOW.agent_config[role], ...(session?.agent_config?.[role] ?? {}) }])) as AgentWorkflow['agent_config'],
+})
 
 function Markdown({ children }: { children: string }) {
   return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown></div>
@@ -50,6 +87,7 @@ export default function App() {
   const [events, setEvents] = useState<AgentEvent[]>([])
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState<Tab>('files')
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [error, setError] = useState('')
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceEntry[]>([])
   const [selectedDiff, setSelectedDiff] = useState('')
@@ -61,6 +99,8 @@ export default function App() {
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [commandMode, setCommandModeState] = useState<CommandMode>('auto')
+  const [crossSessionMemory, setCrossSessionMemoryState] = useState(() => window.localStorage.getItem('mosscode.crossSessionMemory') === 'true')
+  const [agentWorkflow, setAgentWorkflowState] = useState<AgentWorkflow>(() => normalizeWorkflow())
   const [theme, setTheme] = useState<Theme>(() => window.localStorage.getItem('mosscode.theme') === 'dusk' ? 'dusk' : 'light')
   const [authReady, setAuthReady] = useState(false)
   const [authenticated, setAuthenticated] = useState(false)
@@ -183,6 +223,13 @@ export default function App() {
     window.localStorage.setItem('mosscode.theme', theme)
   }, [theme])
 
+  useEffect(() => {
+    if (!settingsOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSettingsOpen(false) }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [settingsOpen])
+
   const refreshSessions = async () => setSessionItems(await listSessions().catch(() => []))
 
   const loadSession = async (id: string) => {
@@ -193,6 +240,8 @@ export default function App() {
     if (version !== loadVersion.current || activeSession.current !== id) return
     setSessionId(session.id); setSessionWorkspace(session.workspace); setTask(''); setSubmittedTask(session.task); setWorkspace(session.workspace); setEvents(session.events); setError('')
     setCommandModeState(session.command_mode)
+    setCrossSessionMemoryState(session.cross_session_memory_enabled)
+    setAgentWorkflowState(normalizeWorkflow(session))
     setRetryableTurnId([...session.turns].reverse().find((turn) => ['failed', 'cancelled', 'interrupted'].includes(turn.status))?.id ?? null)
     if (session.status === 'interrupted') setError(t('errors.execution_interrupted'))
     const files = await getWorkspaceFiles(session.id).catch(() => [])
@@ -230,7 +279,7 @@ export default function App() {
     if (busy) return
     stopPolling()
     loadVersion.current += 1; activeSession.current = null
-    setSessionId(null); setSessionWorkspace(''); setTask(''); setSubmittedTask(''); setEvents([]); setWorkspaceEntries([]); setSelectedDiff(''); setError('')
+    setSessionId(null); setSessionWorkspace(''); setTask(''); setSubmittedTask(''); setEvents([]); setWorkspaceEntries([]); setSelectedDiff(''); setError(''); setSettingsOpen(false)
     window.localStorage.removeItem('mosscode.lastSession')
   }
 
@@ -267,6 +316,34 @@ export default function App() {
     }
   }
 
+  const changeAgentWorkflow = async (workflow: AgentWorkflow) => {
+    const previous = agentWorkflow
+    setAgentWorkflowState(workflow); setError('')
+    if (!sessionId || workspaceChanged) return
+    try { await setAgentWorkflow(sessionId, workflow); await refreshSessions() }
+    catch (reason) {
+      setAgentWorkflowState(previous)
+      const code = reason instanceof Error ? reason.message : String(reason)
+      setError(t(`errors.${code}`, { defaultValue: code }))
+      throw reason
+    }
+  }
+
+  const changeCrossSessionMemory = async (enabled: boolean) => {
+    const previous = crossSessionMemory
+    setCrossSessionMemoryState(enabled); setError('')
+    window.localStorage.setItem('mosscode.crossSessionMemory', String(enabled))
+    if (!sessionId || workspaceChanged) return
+    try { await setCrossSessionMemory(sessionId, enabled); await refreshSessions() }
+    catch (reason) {
+      setCrossSessionMemoryState(previous)
+      window.localStorage.setItem('mosscode.crossSessionMemory', String(previous))
+      const code = reason instanceof Error ? reason.message : String(reason)
+      setError(t(`errors.${code}`, { defaultValue: code }))
+      throw reason
+    }
+  }
+
   const launch = async () => {
     if (!task.trim() || !workspace.trim()) return
     const requestedTask = task.trim()
@@ -292,7 +369,7 @@ export default function App() {
     try {
       const session = continuesSession && sessionId
         ? await appendTurn(sessionId, requestedTask, i18n.language)
-        : await createSession(requestedTask, workspace.trim(), i18n.language, commandMode)
+        : await createSession(requestedTask, workspace.trim(), i18n.language, commandMode, crossSessionMemory, agentWorkflow)
       setSessionId(session.id)
       activeSession.current = session.id
       setSessionWorkspace(session.workspace)
@@ -312,7 +389,7 @@ export default function App() {
       }
       close()
       const refreshed = await getSession(session.id)
-      if (activeSession.current === session.id) { setEvents(refreshed.events); setSubmittedTask(refreshed.task); setCommandModeState(refreshed.command_mode) }
+      if (activeSession.current === session.id) { setEvents(refreshed.events); setSubmittedTask(refreshed.task); setCommandModeState(refreshed.command_mode); setCrossSessionMemoryState(refreshed.cross_session_memory_enabled) }
       setRetryableTurnId([...refreshed.turns].reverse().find((turn) => ['failed', 'cancelled', 'interrupted'].includes(turn.status))?.id ?? null)
       setWorkspaceEntries(await getWorkspaceFiles(session.id).catch(() => []))
       await refreshSessions()
@@ -370,25 +447,15 @@ export default function App() {
   const changedFiles = useMemo(() => (events.filter((event) => event.type === 'task_finished').at(-1)?.payload.changed_files ?? []) as string[], [events])
   const diffTree = useMemo(() => buildTree(diffEntries.map(({ path }) => ({ path, kind: 'file' }))), [diffEntries])
   const activeDiff = diffEntries.find((entry) => entry.path === selectedDiff) ?? diffEntries[0]
-  const displayEvents = useMemo(() => {
-    const latestMilestones = new Map<string, number>()
-    events.forEach((event, index) => {
-      if (event.type !== 'tool_finished') return
-      const tool = String(event.payload.tool ?? '')
-      if (tool === 'write_file' || tool === 'run_command') latestMilestones.set(`${event.turn_id ?? 'session'}:${tool}`, index)
-    })
-    return events.map((event, sourceIndex) => ({ event, sourceIndex })).filter(({ event, sourceIndex }) => {
-      if (event.type === 'task_created' || event.type === 'task_finished' || event.type === 'task_failed' || event.type === 'task_cancelled' || event.type === 'agent_started' || event.type === 'approval_requested' || event.type === 'approval_resolved') return true
-      if (event.type !== 'tool_finished') return false
-      const tool = String(event.payload.tool ?? '')
-      if (tool !== 'write_file' && tool !== 'run_command') return false
-      const key = `${event.turn_id ?? 'session'}:${tool}`
-      return latestMilestones.get(key) === sourceIndex
-    })
-  }, [events])
+  const displayEvents = useMemo(() => selectDisplayEvents(events), [events])
   const hasStoredUserEvents = events.some((event) => event.type === 'task_created' && typeof event.payload.task === 'string')
   const queuedCount = Math.max(0, events.filter((event) => event.type === 'task_created').length - events.filter((event) => event.type === 'task_finished' || event.type === 'task_failed').length - (busy ? 1 : 0))
   const workspaceChanged = Boolean(sessionId) && normalizePath(workspace) !== normalizePath(sessionWorkspace)
+  const commandModeOptions = useMemo(() => ([
+    { value:'auto' as CommandMode, label:t('permissions.auto'), description:t('permissions.autoMenuDetail') },
+    { value:'ask' as CommandMode, label:t('permissions.ask'), description:t('permissions.askMenuDetail') },
+    { value:'deny' as CommandMode, label:t('permissions.deny'), description:t('permissions.denyMenuDetail') },
+  ]), [t])
 
   if (!authReady) return <div className="auth-shell"><div className="auth-loader"><span className="brand-mark"><Bot size={24}/></span><LoaderCircle className="spin" size={20}/><p>{t('auth.checking')}</p></div></div>
   if (!authenticated) return <div className="auth-shell">
@@ -413,14 +480,15 @@ export default function App() {
       <div className="run-state"><span className={busy ? 'pulse' : 'ready-dot'}/>{busy ? `${t('running')} · ${formatElapsed(elapsedSeconds)}` : t('ready')}</div>
       <div className="topbar-actions"><div className="locale" aria-label={t('language')}><button className={i18n.language === 'zh-CN' ? 'active' : ''} onClick={() => i18n.changeLanguage('zh-CN')}>中文</button><button className={i18n.language === 'en-US' ? 'active' : ''} onClick={() => i18n.changeLanguage('en-US')}>EN</button></div><button className="icon-action" type="button" onClick={() => setTheme(theme === 'light' ? 'dusk' : 'light')} title={t('theme.toggle')}>{theme === 'light' ? <Moon size={16}/> : <Sun size={16}/>}</button><div className="user-chip"><span><UserRound size={14}/>{username}</span><button type="button" onClick={() => void submitLogout()} title={t('auth.signOut')}><LogOut size={14}/></button></div></div>
     </header>
-    <section className="workspace-layout">
+    <section className={`workspace-layout ${tab === 'diff' ? 'diff-focused' : ''}`}>
       <aside className="task-sidebar">
         <div className="sidebar-title"><MessageSquareText size={17}/><span>{t('conversations')}</span><button type="button" onClick={newConversation} disabled={busy} title={t('newTask')}><Plus size={15}/></button></div>
         <div className="session-list">{sessionItems.length ? sessionItems.map((session) => <button type="button" className={session.id === sessionId ? 'active' : ''} onClick={() => void loadSession(session.id)} disabled={busy} key={session.id}><strong>{session.title}</strong><small>{t('turnCount', { count: session.turn_count })}</small></button>) : <p>{t('noConversations')}</p>}</div>
         <button className="new-conversation" type="button" onClick={newConversation} disabled={busy}><Plus size={15}/>{t('newTask')}</button>
         <label className="field"><span>{t('workspace')}</span><input value={workspace} onChange={(e) => setWorkspace(e.target.value)} placeholder={t('workspacePlaceholder')} disabled={busy}/><small>{workspaceChanged ? t('workspaceChanged') : sessionId ? t('workspaceActive') : t('workspaceHint')}</small></label>
-        <label className="field permission-field"><span><ShieldCheck size={14}/>{t('permissions.title')}</span><select value={commandMode} disabled={busy} onChange={(event) => void changeCommandMode(event.target.value as CommandMode)}><option value="auto">{t('permissions.auto')}</option><option value="ask">{t('permissions.ask')}</option><option value="deny">{t('permissions.deny')}</option></select><small>{t(`permissions.${commandMode}Detail`)}</small></label>
+        <div className="field permission-field"><span><ShieldCheck size={14}/>{t('permissions.title')}</span><SelectMenu label={t('permissions.title')} value={commandMode} options={commandModeOptions} disabled={busy} onChange={(value) => void changeCommandMode(value)}/><small>{t(`permissions.${commandMode}Detail`)}</small></div>
         <p className="safe-note"><CircleAlert size={15}/><span>{t('safeExecution')}</span></p>
+        <button className={`sidebar-settings ${settingsOpen ? 'active' : ''}`} type="button" onClick={() => setSettingsOpen(true)}><Settings2 size={15}/><span>{t('settings.title')}</span><ChevronRight size={14}/></button>
       </aside>
       <section className="conversation">
         <header className="conversation-head"><div><h2>{t('conversation')}</h2><p>{submittedTask ? t(busy ? 'privateProgress' : 'conversationReady') : t('conversationHint')}</p></div><Sparkles size={19}/></header>
@@ -436,15 +504,20 @@ export default function App() {
         <div className="composer-wrap"><div className="composer"><textarea value={task} onChange={(e) => setTask(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) void launch() }} placeholder={t(busy ? 'interruptPlaceholder' : sessionId ? 'followupPlaceholder' : 'taskPlaceholder')}/><div className="composer-actions"><span>{busy ? t('interruptHint') : sessionId ? t('memoryHint') : t('submitHint')}</span><div className="composer-buttons">{busy && executionId && <button className="cancel-button" type="button" onClick={() => void cancelExecution(executionId)}><Square size={13}/>{t('cancelRun')}</button>}<button className="send-button" disabled={!task.trim() || !workspace.trim() || (busy && !sessionId)} onClick={() => void launch()}>{busy ? <Plus size={17}/> : <Play size={16}/>}<span>{busy ? t('queueMessage') : workspaceChanged ? t('startNewWorkspace') : sessionId ? t('continueConversation') : t('start')}</span></button></div></div></div></div>
       </section>
       <aside className="inspector">
-        <nav className="tabs"><button className={tab === 'files' ? 'active' : ''} onClick={() => setTab('files')}><FolderTree size={15}/>{t('files')}</button><button className={tab === 'diff' ? 'active' : ''} onClick={() => setTab('diff')}><Code2 size={15}/>{t('diff')}</button><button className={tab === 'terminal' ? 'active' : ''} onClick={() => setTab('terminal')}><TerminalSquare size={15}/>{t('terminal')}</button><button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}><Settings2 size={15}/>{t('settings.title')}</button></nav>
+        <nav className="tabs"><button className={tab === 'files' ? 'active' : ''} onClick={() => setTab('files')}><FolderTree size={15}/>{t('files')}</button><button className={tab === 'diff' ? 'active' : ''} onClick={() => setTab('diff')}><Code2 size={15}/>{t('diff')}</button><button className={tab === 'terminal' ? 'active' : ''} onClick={() => setTab('terminal')}><TerminalSquare size={15}/>{t('terminal')}</button></nav>
         <div className="inspector-content">
           {tab === 'files' && <>{changedFiles.length > 0 && <div className="changed-summary"><Check size={15}/>{t('changedCount', { count: changedFiles.length })}</div>}<FileWorkbench sessionId={sessionId} entries={workspaceEntries} onFilesChanged={async () => setWorkspaceEntries(sessionId ? await getWorkspaceFiles(sessionId).catch(() => []) : [])}/></>}
-          {tab === 'diff' && (diffTree.length ? <div className="diff-layout"><section className="tree-panel change-tree"><div className="inspector-section-title"><GitBranch size={14}/><span>{t('changeTree')}</span><small>{t('fileCount', { count: diffEntries.length })}</small></div><TreeView nodes={diffTree} selected={activeDiff?.path} onSelect={setSelectedDiff}/></section>{activeDiff && <details className="diff-file" open><summary><FileText size={14}/><span>{activeDiff.path}</span><ChevronRight className="diff-collapse-chevron" size={14}/></summary><pre className="code-view diff-view">{activeDiff.diff || t('emptyDiff')}</pre></details>}</div> : <EmptyInspector text={t('noDiff')}/>)}
+          {tab === 'diff' && (diffTree.length ? <div className="diff-layout"><section className="tree-panel change-tree"><div className="inspector-section-title"><GitBranch size={14}/><span>{t('changeTree')}</span><small>{t('fileCount', { count: diffEntries.length })}</small></div><TreeView nodes={diffTree} selected={activeDiff?.path} onSelect={setSelectedDiff}/></section>{activeDiff && <details className="diff-file" open><summary><FileText size={14}/><span>{activeDiff.path}</span><ChevronRight className="diff-collapse-chevron" size={14}/></summary><SideBySideDiff diff={activeDiff.diff}/></details>}</div> : <EmptyInspector text={t('noDiff')}/>)}
           {tab === 'terminal' && (terminalRuns.length ? <div className="terminal-runs">{terminalRuns.map((run, index) => <section className={`terminal-card ${run.ok ? 'passed' : 'failed'}`} key={`${run.command}-${index}`}><header>{run.ok ? <CircleCheck size={15}/> : <CircleX size={15}/>}<div><strong>{run.command || t('commandNumber', { count: index + 1 })}</strong><small>{t(run.ok ? 'commandPassed' : 'commandFailed')} · {t('exitCode', { code: run.exitCode })}</small></div></header><pre>{run.output || t('noCommandOutput')}</pre></section>)}</div> : <EmptyInspector text={t('terminalWaiting')}/>)}
-          {tab === 'settings' && <SettingsPanel sessionId={sessionId}/>}
         </div>
       </aside>
     </section>
+    {settingsOpen && <div className="settings-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}>
+      <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
+        <header className="settings-dialog-head"><div><span className="settings-dialog-icon"><Settings2 size={18}/></span><span><strong id="settings-dialog-title">{t('settings.title')}</strong><small>{t('settings.projectDetail')}</small></span></div><button type="button" onClick={() => setSettingsOpen(false)} aria-label={t('workbench.backToEdit')} title={t('workbench.backToEdit')}><X size={17}/></button></header>
+        <SettingsPanel sessionId={sessionId} crossSessionMemory={crossSessionMemory} onCrossSessionMemoryChange={changeCrossSessionMemory} agentWorkflow={agentWorkflow} onAgentWorkflowChange={changeAgentWorkflow} busy={busy}/>
+      </section>
+    </div>}
   </main>
 
 }
@@ -453,7 +526,10 @@ const EventMessage = memo(function EventMessage({ event, events, onApprovalError
   const { t } = useTranslation()
   const position = Number(events.find((candidate) => candidate.type === 'task_created' && candidate.turn_id === event.turn_id)?.payload.position ?? 0)
   if (event.type === 'task_created' && typeof event.payload.task === 'string') return <article className="message user-message" data-user-turn={event.turn_id ?? `turn-${position}`} data-turn-label={String(event.payload.position ?? position ?? 1)}><div className="message-label">{t('you')} · {t('turnLabel', { count: Number(event.payload.position ?? 1) })}</div><p>{String(event.payload.task)}</p></article>
-  if (event.type === 'agent_started' && event.role) return <div className="progress-update"><span/><p>{t(`publicProgress.${event.role}`)}</p></div>
+  if (event.type === 'agent_started' && event.role) {
+    const progressKey = event.payload?.repairing ? 'publicProgress.repair' : `publicProgress.${event.role}`
+    return <div className="progress-update"><span/><p>{t(progressKey)}</p></div>
+  }
   if (event.type === 'tool_finished') {
     const result = event.payload.result as ToolResult
     const tool = String(event.payload.tool ?? '')

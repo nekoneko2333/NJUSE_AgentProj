@@ -5,7 +5,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.agents.orchestrator import Orchestrator, parse_reviewer_verdict
+from app.agents.orchestrator import Orchestrator, is_continuation_task, is_conversational_task, is_file_mutation_command, is_inspection_command, normalize_agent_config, parse_reviewer_basis, parse_reviewer_verdict, resolve_agent_mode
 from app.core.settings import settings
 from app.core.models import AgentRole
 from app.core.auth import LocalAuth
@@ -67,7 +67,7 @@ class NeverWritesClient:
 class RejectingReviewerClient(FakeClient):
     async def complete(self, messages, tools):
         if "reviewer agent" in messages[0]["content"]:
-            return {"role": "assistant", "content": "VERDICT: NEEDS_WORK 测试仍然失败"}
+            return {"role": "assistant", "content": "VERDICT: NEEDS_WORK\nBASIS: FAILED_VERIFICATION\nEVIDENCE: unittest exit_code=1\nACTION: 修复失败测试"}
         return await super().complete(messages, tools)
 
 
@@ -97,6 +97,137 @@ class StructuredEvidenceClient(FakeClient):
             command = f'"{sys.executable}" -c "print(123)"'
             return {"role": "assistant", "content": None, "tool_calls": [{"id": "verify", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
         return {"role": "assistant", "content": "已完成"}
+
+
+class ScopeDriftingReviewerClient(StructuredEvidenceClient):
+    """模拟 Reviewer 在测试成功后擅自增加用户从未要求的入口规范。"""
+    async def complete(self, messages, tools):
+        if "reviewer agent" in messages[0]["content"]:
+            return {"role": "assistant", "content": "VERDICT: NEEDS_WORK 还应增加 if __name__ == '__main__' 入口。"}
+        return await super().complete(messages, tools)
+
+
+class ConversationalMemoryClient:
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, messages, tools):
+        self.calls.append((messages, tools))
+        return {"role": "assistant", "content": "我是小m，你的统一 MossCode 助手。"}
+
+
+class RepairingWorkflowClient:
+    def __init__(self):
+        self.initial_written = False
+        self.initial_verified = False
+        self.repair_written = False
+        self.repair_verified = False
+        self.reviewer_calls = 0
+        self.reviewer_inputs = []
+
+    async def complete(self, messages, tools):
+        system = messages[0]["content"]
+        if "reviewer agent" in system:
+            self.reviewer_calls += 1
+            self.reviewer_inputs.append(messages[1]["content"])
+            if self.reviewer_calls == 1:
+                return {"role": "assistant", "content": "VERDICT: NEEDS_WORK\nBASIS: USER_REQUIREMENT\nEVIDENCE: result.txt 内容为 wrong，用户要求 correct\nACTION: 将 result.txt 改为 correct"}
+            return {"role": "assistant", "content": "VERDICT: PASS 已核对修复内容和成功验证。"}
+        if "coder agent" not in system:
+            return {"role": "assistant", "content": "已完成本角色工作。"}
+
+        repairing = "有限返工" in messages[1]["content"]
+        if repairing and not self.repair_written:
+            self.repair_written = True
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "repair-write", "type": "function", "function": {"name": "write_file", "arguments": '{"path":"result.txt","content":"correct\\n"}'}}]}
+        if repairing and not self.repair_verified:
+            self.repair_verified = True
+            command = f'"{sys.executable}" -c "from pathlib import Path; assert Path(\'result.txt\').read_text().strip() == \'correct\'"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "repair-test", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        if not repairing and not self.initial_written:
+            self.initial_written = True
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "initial-write", "type": "function", "function": {"name": "write_file", "arguments": '{"path":"result.txt","content":"wrong\\n"}'}}]}
+        if not repairing and not self.initial_verified:
+            self.initial_verified = True
+            command = f'"{sys.executable}" -c "from pathlib import Path; assert Path(\'result.txt\').exists()"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "initial-test", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        return {"role": "assistant", "content": "实现和验证已完成。"}
+
+
+class ResumeExistingClient:
+    def __init__(self):
+        self.verified = False
+        self.reviewer_context = ""
+
+    async def complete(self, messages, tools):
+        system = messages[0]["content"]
+        if "reviewer agent" in system:
+            self.reviewer_context = messages[1]["content"]
+            return {"role": "assistant", "content": "VERDICT: PASS 已确认保留的实现和最新验证。"}
+        names = {tool["function"]["name"] for tool in tools}
+        if "coder agent" in system and "run_command" in names and not self.verified:
+            self.verified = True
+            command = f'"{sys.executable}" -c "from pathlib import Path; assert Path(\'existing.txt\').read_text().strip() == \'ready\'"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "resume-test", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        return {"role": "assistant", "content": "现有实现已经符合要求。"}
+
+
+class TurnLimitedResumeClient:
+    def __init__(self):
+        self.command_index = 0
+
+    async def complete(self, messages, tools):
+        system = messages[0]["content"]
+        if "reviewer agent" in system:
+            return {"role": "assistant", "content": "VERDICT: PASS 已依据成功验证复核。"}
+        names = {tool["function"]["name"] for tool in tools}
+        if "coder agent" in system and "run_command" in names:
+            self.command_index += 1
+            command = f'"{sys.executable}" -c "print({self.command_index})"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": f"verify-{self.command_index}", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        return {"role": "assistant", "content": "已完成本角色工作。"}
+
+
+class InspectionHeavyRepairClient:
+    def __init__(self):
+        self.initial_written = False
+        self.initial_verified = False
+        self.repair_reads = 0
+        self.repair_written = False
+        self.repair_verified = False
+        self.reviewer_calls = 0
+        self.repair_tool_names = []
+
+    async def complete(self, messages, tools):
+        system = messages[0]["content"]
+        names = {tool["function"]["name"] for tool in tools}
+        if "reviewer agent" in system:
+            self.reviewer_calls += 1
+            verdict = "VERDICT: NEEDS_WORK\nBASIS: USER_REQUIREMENT\nEVIDENCE: result.txt 尚不是 fixed\nACTION: 将 result.txt 修正为 fixed" if self.reviewer_calls == 1 else "VERDICT: PASS 修复和验证均已确认。"
+            return {"role": "assistant", "content": verdict}
+        if "coder agent" not in system:
+            return {"role": "assistant", "content": "已完成。"}
+        repairing = "有限返工" in messages[1]["content"]
+        if repairing:
+            self.repair_tool_names.append(sorted(names))
+        if not repairing and not self.initial_written:
+            self.initial_written = True
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "initial-write", "type": "function", "function": {"name": "write_file", "arguments": '{"path":"result.txt","content":"wrong\\n"}'}}]}
+        if not repairing and not self.initial_verified:
+            self.initial_verified = True
+            command = f'"{sys.executable}" -c "print(1)"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "initial-test", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        if repairing and not self.repair_written and "run_command" in names and self.repair_reads < 10:
+            self.repair_reads += 1
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": f"repair-read-{self.repair_reads}", "type": "function", "function": {"name": "run_command", "arguments": '{"command":"type result.txt"}'}}]}
+        if repairing and not self.repair_written:
+            self.repair_written = True
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "repair-write", "type": "function", "function": {"name": "write_file", "arguments": '{"path":"result.txt","content":"fixed\\n"}'}}]}
+        if repairing and not self.repair_verified:
+            self.repair_verified = True
+            command = f'"{sys.executable}" -c "from pathlib import Path; assert Path(\'result.txt\').read_text().strip() == \'fixed\'"'
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "repair-test", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": command})}}]}
+        return {"role": "assistant", "content": "实现已完成。"}
 
 
 class CoreTests(unittest.TestCase):
@@ -140,6 +271,23 @@ class CoreTests(unittest.TestCase):
             completed, events = asyncio.run(exercise(directory))
             self.assertTrue(completed)
             self.assertEqual(events[-1].payload["completion_source"], "structured_evidence")
+
+    def test_reviewer_cannot_expand_scope_after_successful_verification(self):
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "test", "创建并验证 evidence.txt", ToolRegistry(Workspace(directory)),
+                ScopeDriftingReviewerClient(), settings, publish,
+            )
+            return await runner.run(), runner, events
+
+        with TemporaryDirectory() as directory:
+            completed, runner, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual(runner.repair_cycles, 0)
+            self.assertEqual(events[-1].payload["completion_source"], "structured_evidence")
+            self.assertFalse(any(event.type == "task_failed" for event in events))
     def test_local_auth_accepts_configured_credentials_and_unicode_failures(self):
         auth = LocalAuth(Settings(app_username="moss", app_password="安全密码"))
         self.assertIsNone(auth.authenticate("moss", "错误密码"))
@@ -180,6 +328,64 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(allowed.ok)
             self.assertEqual(denied.code, "command_permission_denied")
             self.assertEqual(len(approvals), 1)
+
+    def test_windows_tail_pipeline_is_rejected_before_requesting_approval(self):
+        async def exercise(directory):
+            approvals = []
+            async def approve(role, command, cwd):
+                approvals.append((role, command, cwd))
+                return True
+            runner = Orchestrator(
+                "test", "只读检查", ToolRegistry(Workspace(directory)), FakeClient(), settings,
+                lambda event: asyncio.sleep(0), command_mode="ask", request_command_approval=approve,
+            )
+            result = await runner._execute(AgentRole.CODER, "run_command", {"command": "echo ok | tail -40"})
+            return result, approvals
+        with TemporaryDirectory() as directory:
+            result, approvals = asyncio.run(exercise(directory))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "unsupported_windows_shell_syntax")
+            self.assertEqual(approvals, [])
+
+    def test_outside_command_cwd_is_rejected_before_requesting_approval(self):
+        async def exercise(directory):
+            approvals = []
+            async def approve(role, command, cwd):
+                approvals.append((role, command, cwd))
+                return True
+            runner = Orchestrator(
+                "test", "只读检查", ToolRegistry(Workspace(directory)), FakeClient(), settings,
+                lambda event: asyncio.sleep(0), command_mode="ask", request_command_approval=approve,
+            )
+            result = await runner._execute(AgentRole.CODER, "run_command", {"command": "echo ok", "cwd": "../outside"})
+            return result, approvals
+        with TemporaryDirectory() as directory:
+            result, approvals = asyncio.run(exercise(directory))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "path_outside_workspace")
+            self.assertEqual(approvals, [])
+
+    def test_command_side_effects_are_rejected_before_approval_and_require_write_file(self):
+        async def exercise(directory):
+            approvals = []
+            async def approve(role, command, cwd):
+                approvals.append((role, command, cwd))
+                return True
+            runner = Orchestrator(
+                "test", "检查并修复", ToolRegistry(Workspace(directory)), FakeClient(), settings,
+                lambda event: asyncio.sleep(0), command_mode="ask", request_command_approval=approve,
+            )
+            result = await runner._execute(AgentRole.REVIEWER, "run_command", {"command": "python -c \"open('reviewer.txt','w').write('bad')\""})
+            return result, approvals, Path(directory, "reviewer.txt").exists()
+        with TemporaryDirectory() as directory:
+            result, approvals, created = asyncio.run(exercise(directory))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "command_file_mutation_not_allowed")
+            self.assertEqual(approvals, [])
+            self.assertFalse(created)
+            self.assertTrue(is_file_mutation_command("Path('x').write_text('bad')"))
+            self.assertTrue(is_inspection_command("type main.py"))
+            self.assertTrue(is_inspection_command("python -c \"print(open('main.py').read())\""))
     def test_reviewer_verdict_parser_accepts_marker_after_natural_prefix(self):
         passed, detail = parse_reviewer_verdict("已核对九项测试。\nVERDICT: PASS\n全部通过。")
         self.assertTrue(passed)
@@ -190,6 +396,10 @@ class CoreTests(unittest.TestCase):
         passed, detail = parse_reviewer_verdict("VERDICT: PASS 初检。\nVERDICT: NEEDS_WORK 仍有失败。")
         self.assertFalse(passed)
         self.assertIn("仍有失败", detail)
+
+    def test_reviewer_rejection_requires_a_traceable_basis(self):
+        self.assertEqual(parse_reviewer_basis("VERDICT: NEEDS_WORK\nBASIS: USER_REQUIREMENT\nEVIDENCE: x\nACTION: y"), "USER_REQUIREMENT")
+        self.assertEqual(parse_reviewer_basis("VERDICT: NEEDS_WORK 因为我觉得还不够好"), "")
 
     def test_risky_command_is_blocked(self):
         tools = ToolRegistry(Workspace(r"C:\Desktop\NJUSE_AgentProj"))
@@ -229,6 +439,102 @@ class CoreTests(unittest.TestCase):
             self.assertIn("src/nested/app.py", paths)
             self.assertNotIn("node_modules", paths)
             self.assertNotIn("node_modules/hidden.js", paths)
+
+    def test_search_text_accepts_a_direct_file_path(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page.html").write_text("<title>松林任务台</title>\n", encoding="utf-8")
+            result = ToolRegistry(Workspace(directory)).search_text("松林任务台", "page.html")
+            self.assertTrue(result.ok)
+            self.assertEqual(result.meta["matches"][0]["path"], "page.html")
+            self.assertEqual(result.meta["matches"][0]["line"], 1)
+
+    def test_reviewer_rejection_enters_a_bounded_repair_cycle(self):
+        async def exercise(directory):
+            events, client = [], RepairingWorkflowClient()
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "test", "创建并验证 result.txt，内容必须为 correct",
+                ToolRegistry(Workspace(directory)), client, settings, publish,
+            )
+            completed = await runner.run()
+            return completed, runner, events, client
+
+        with TemporaryDirectory() as directory:
+            completed, runner, events, client = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual((Path(directory) / "result.txt").read_text(encoding="utf-8"), "correct\n")
+            self.assertEqual(runner.repair_cycles, 1)
+            self.assertEqual(client.reviewer_calls, 2)
+            self.assertIn("exit_code=0", client.reviewer_inputs[0])
+            self.assertIn("Frozen acceptance scope", client.reviewer_inputs[0])
+            self.assertIn("Only open issue from the previous review", client.reviewer_inputs[1])
+            self.assertIn("BASIS: USER_REQUIREMENT", client.reviewer_inputs[1])
+            self.assertIn("ACTION:", client.reviewer_inputs[1])
+            self.assertTrue(any(event.payload.get("repairing") for event in events))
+            self.assertEqual(events[-1].type, "task_finished")
+            self.assertEqual(events[-1].payload["repair_cycles"], 1)
+            self.assertFalse(any(event.type == "task_failed" for event in events))
+
+    def test_short_retry_inherits_the_previous_engineering_task_and_can_verify_retained_files(self):
+        async def exercise(directory):
+            events, client = [], ResumeExistingClient()
+            async def publish(event): events.append(event)
+            (Path(directory) / "existing.txt").write_text("ready\n", encoding="utf-8")
+            runner = Orchestrator(
+                "test", "重试", ToolRegistry(Workspace(directory)), client, settings, publish,
+                conversation_context="第2轮（failed） 用户：创建并验证 existing.txt 结果：实现者达到轮次上限。",
+                reference_task="创建并验证 existing.txt，内容必须为 ready",
+                resume_existing=True,
+            )
+            completed = await runner.run()
+            return completed, runner, events, client
+
+        with TemporaryDirectory() as directory:
+            completed, runner, events, client = asyncio.run(exercise(directory))
+            self.assertTrue(is_continuation_task("继续完成我上面的要求"))
+            self.assertTrue(completed)
+            self.assertFalse(runner.conversation_only)
+            self.assertTrue(runner.requires_change)
+            self.assertEqual(runner.changed_files, set())
+            self.assertIn("Referenced earlier task", client.reviewer_context)
+            self.assertIn("exit_code=0", client.reviewer_context)
+            self.assertEqual(events[-1].type, "task_finished")
+
+    def test_resumed_coder_turn_limit_hands_off_to_reviewer_instead_of_failing(self):
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "test", "继续完成上面的要求", ToolRegistry(Workspace(directory)), TurnLimitedResumeClient(), settings, publish,
+                reference_task="创建并验证项目文件", resume_existing=True,
+                agent_config={"coder": {"max_turns": 2}},
+            )
+            return await runner.run(), runner, events
+
+        with TemporaryDirectory() as directory:
+            completed, runner, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual(runner.failure_reason, "")
+            self.assertTrue(any(event.role == AgentRole.CODER and event.payload.get("reason") == "turn_limit" for event in events))
+            self.assertEqual(events[-1].type, "task_finished")
+
+    def test_repair_inspection_budget_removes_read_tools_and_preserves_write_budget(self):
+        async def exercise(directory):
+            events, client = [], InspectionHeavyRepairClient()
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "test", "创建并验证 result.txt", ToolRegistry(Workspace(directory)), client, settings, publish,
+                agent_config={"coder": {"max_turns": 10}},
+            )
+            return await runner.run(), runner, client, events
+        with TemporaryDirectory() as directory:
+            completed, runner, client, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual(client.repair_reads, 3, client.repair_tool_names)
+            self.assertEqual(runner.repair_cycles, 1)
+            self.assertEqual((Path(directory) / "result.txt").read_text(encoding="utf-8"), "fixed\n")
+            self.assertEqual(events[-1].type, "task_finished")
 
     def test_orchestrator_runs_all_roles(self):
         async def exercise():
@@ -340,9 +646,57 @@ class CoreTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             completed, reason, events = asyncio.run(exercise(directory))
             self.assertFalse(completed)
-            self.assertEqual(reason, "reviewer_rejected")
+            self.assertEqual(reason, "verification_incomplete_after_repairs")
             self.assertEqual(events[-1].type, "task_failed")
             self.assertFalse(any(event.type == "task_finished" for event in events))
+
+    def test_single_agent_is_a_real_verified_execution_path(self):
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator("test", "创建并验证文件", ToolRegistry(Workspace(directory)), StructuredEvidenceClient(), settings, publish, execution_mode="single")
+            return await runner.run(), events
+        with TemporaryDirectory() as directory:
+            completed, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            started_roles = [event.role for event in events if event.type == "agent_started"]
+            self.assertEqual(started_roles, [AgentRole.SINGLE])
+            self.assertEqual(events[-1].payload["execution_mode"], "single")
+
+    def test_multi_agent_roles_can_be_disabled_but_coder_is_forced_on(self):
+        config = normalize_agent_config({
+            "planner": {"enabled": False}, "explorer": {"enabled": False},
+            "coder": {"enabled": False, "max_turns": 30, "instruction": "优先运行测试"},
+            "reviewer": {"enabled": False},
+        })
+        self.assertTrue(config["coder"]["enabled"])
+        self.assertEqual(config["coder"]["instruction"], "优先运行测试")
+
+    def test_adaptive_mode_records_a_deterministic_choice(self):
+        self.assertEqual(resolve_agent_mode("解释这个文件", "adaptive"), "single")
+        self.assertEqual(resolve_agent_mode("重构前后端架构并补充测试", "adaptive"), "multi")
+
+    def test_identity_question_bypasses_reviewer_and_honors_preference_memory(self):
+        async def exercise(directory):
+            events, client = [], ConversationalMemoryClient()
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "test", "你是谁？", ToolRegistry(Workspace(directory)), client, settings, publish,
+                conversation_context="同一工作区的用户偏好：用户要求称呼助手为小m。", execution_mode="multi",
+                memory_metadata={"cross_session_enabled": True, "shared_memory_loaded": True, "preference_count": 1},
+            )
+            return await runner.run(), events, client
+        with TemporaryDirectory() as directory:
+            completed, events, client = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertTrue(is_conversational_task("你是谁？"))
+            self.assertFalse(is_conversational_task("检查项目代码"))
+            self.assertEqual([event.role for event in events if event.type == "agent_started"], [AgentRole.SINGLE])
+            self.assertEqual(client.calls[0][1], [])
+            self.assertIn("小m", events[-1].summary)
+            self.assertNotIn("只读检查", events[-1].summary)
+            self.assertEqual(events[-1].payload["intent"], "conversation")
+            self.assertEqual(events[0].payload["preference_count"], 1)
 
 
 if __name__ == "__main__":

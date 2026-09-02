@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections import defaultdict
 from dataclasses import replace
@@ -13,11 +14,11 @@ from fastapi.responses import StreamingResponse
 
 from app.core.context import ContextManager
 from app.core.auth import LocalAuth
-from app.core.checkpoints import CheckpointManager
+from app.core.checkpoints import CheckpointManager, content_sha256
 from app.core.extensions import HookConfig, MCPManager, load_project_rules
-from app.core.models import AgentEvent, AgentRole, AppendTurnRequest, ApprovalDecisionRequest, CheckpointSnapshot, CreateTaskRequest, EventType, ExecutionSnapshot, FileWriteRequest, LoginRequest, ModelSettingsRequest, SessionListItem, SessionSnapshot, UpdateCommandModeRequest
+from app.core.models import AgentEvent, AgentRole, AppendTurnRequest, ApprovalDecisionRequest, CheckpointSnapshot, CreateTaskRequest, EventType, ExecutionSnapshot, FileWriteRequest, LoginRequest, ModelSettingsRequest, ProjectConfigWriteRequest, SessionListItem, SessionSnapshot, UpdateAgentWorkflowRequest, UpdateCommandModeRequest, UpdateCrossSessionMemoryRequest
 from app.core.settings import settings
-from app.agents.orchestrator import Orchestrator
+from app.agents.orchestrator import ORCHESTRATOR_PROTOCOL, Orchestrator, is_continuation_task, normalize_agent_config
 from app.llm.client import OpenAICompatibleClient, LLMError
 from app.runtime.workspace import Workspace, WorkspaceError
 from app.storage.sqlite_store import SQLiteStore
@@ -56,7 +57,7 @@ async def publish(event: AgentEvent) -> None:
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "storage": "sqlite"}
+    return {"status": "ok", "storage": "sqlite", "orchestrator_protocol": ORCHESTRATOR_PROTOCOL}
 
 
 @app.get("/api/settings/model")
@@ -102,7 +103,7 @@ async def create_session(payload: CreateTaskRequest, _user: str = Depends(auth.r
         Workspace(payload.workspace)
     except WorkspaceError as error:
         raise HTTPException(422, detail=str(error)) from error
-    session, turn = store.create_session(task=payload.task, workspace=payload.workspace, locale=payload.locale, command_mode=payload.command_mode)
+    session, turn = store.create_session(task=payload.task, workspace=payload.workspace, locale=payload.locale, command_mode=payload.command_mode, cross_session_memory_enabled=payload.cross_session_memory_enabled, agent_mode=payload.agent_mode, agent_config=normalize_agent_config(payload.agent_config))
     await publish(AgentEvent(type=EventType.TASK_CREATED, session_id=session.id, turn_id=turn.id, summary="任务已创建", payload={"locale": payload.locale, "task": payload.task, "position": turn.position}))
     return store.get_session(session.id)  # type: ignore[return-value]
 
@@ -138,6 +139,28 @@ async def update_command_mode(session_id: str, payload: UpdateCommandModeRequest
     return store.get_session(session_id)  # type: ignore[return-value]
 
 
+@app.patch("/api/sessions/{session_id}/cross-session-memory", response_model=SessionSnapshot)
+async def update_cross_session_memory(session_id: str, payload: UpdateCrossSessionMemoryRequest, _user: str = Depends(auth.require_user)) -> SessionSnapshot:
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, detail="session_not_found")
+    if session.status == "running":
+        raise HTTPException(409, detail="session_already_running")
+    store.update_cross_session_memory(session_id, payload.enabled)
+    return store.get_session(session_id)  # type: ignore[return-value]
+
+
+@app.patch("/api/sessions/{session_id}/agent-workflow", response_model=SessionSnapshot)
+async def update_agent_workflow(session_id: str, payload: UpdateAgentWorkflowRequest, _user: str = Depends(auth.require_user)) -> SessionSnapshot:
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, detail="session_not_found")
+    if session.status == "running":
+        raise HTTPException(409, detail="session_already_running")
+    store.update_agent_workflow(session_id, payload.agent_mode, normalize_agent_config(payload.agent_config))
+    return store.get_session(session_id)  # type: ignore[return-value]
+
+
 @app.get("/api/sessions/{session_id}/workspace-files")
 async def get_workspace_files(session_id: str, _user: str = Depends(auth.require_user)) -> dict[str, object]:
     session = store.get_session(session_id)
@@ -149,18 +172,57 @@ async def get_workspace_files(session_id: str, _user: str = Depends(auth.require
     return result.meta
 
 
+def _config_file(workspace: Path, relative_path: str) -> dict[str, object]:
+    target = (workspace / relative_path).resolve()
+    if not target.is_file():
+        return {"path": relative_path, "exists": False, "content": "", "sha256": ""}
+    content = target.read_text(encoding="utf-8", errors="replace")
+    return {"path": relative_path, "exists": True, "content": content, "sha256": content_sha256(content)}
+
+
+def _project_config_payload(workspace: Path) -> dict[str, object]:
+    rules = load_project_rules(workspace)
+    return {
+        "rules": {"text": rules.text, "sources": rules.sources, "truncated": rules.truncated, "file": _config_file(workspace, "AGENTS.md")},
+        "hooks": {**HookConfig(workspace).status(), "file": _config_file(workspace, ".mosscode/hooks.json")},
+        "mcp": {**MCPManager(workspace, min(int(runtime_model_settings["command_timeout_seconds"]), 15)).status(), "file": _config_file(workspace, ".mosscode/mcp.json")},
+    }
+
+
 @app.get("/api/sessions/{session_id}/project-config")
 async def get_project_config(session_id: str, _user: str = Depends(auth.require_user)) -> dict[str, object]:
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(404, detail="session_not_found")
-    workspace = Workspace(session.workspace).root
-    rules = load_project_rules(workspace)
-    return {
-        "rules": {"text": rules.text, "sources": rules.sources, "truncated": rules.truncated},
-        "hooks": HookConfig(workspace).status(),
-        "mcp": MCPManager(workspace, min(int(runtime_model_settings["command_timeout_seconds"]), 15)).status(),
-    }
+    return _project_config_payload(Workspace(session.workspace).root)
+
+
+@app.put("/api/sessions/{session_id}/project-config")
+async def update_project_config(session_id: str, payload: ProjectConfigWriteRequest, _user: str = Depends(auth.require_user)) -> dict[str, object]:
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, detail="session_not_found")
+    if session.status == "running":
+        raise HTTPException(409, detail="session_already_running")
+    paths = {"agents": "AGENTS.md", "hooks": ".mosscode/hooks.json", "mcp": ".mosscode/mcp.json"}
+    path = paths[payload.kind]
+    if payload.kind in {"hooks", "mcp"}:
+        try:
+            parsed = json.loads(payload.content)
+        except json.JSONDecodeError as error:
+            raise HTTPException(422, detail="invalid_config_json") from error
+        if not isinstance(parsed, dict) or (payload.kind == "hooks" and not isinstance(parsed.get("hooks", {}), dict)) or (payload.kind == "mcp" and not isinstance(parsed.get("servers", {}), dict)):
+            raise HTTPException(422, detail="invalid_config_shape")
+    workspace = Workspace(session.workspace)
+    current = _config_file(workspace.root, path)
+    if str(current["sha256"]) != payload.expected_sha256:
+        raise HTTPException(409, detail="file_changed")
+    checkpoint = CheckpointManager(checkpoint_root, store, session_id, None, f"更新项目配置 {path}")
+    result = ToolRegistry(workspace, checkpoint=checkpoint).write_file(path, payload.content)
+    if not result.ok:
+        raise HTTPException(422, detail=result.code)
+    await publish(AgentEvent(type=EventType.CHECKPOINT_CREATED, session_id=session_id, summary="已更新项目配置并创建检查点。", payload={"checkpoint_id": result.meta.get("checkpoint_id"), "path": path}))
+    return _project_config_payload(workspace.root)
 
 
 @app.get("/api/sessions/{session_id}/files/content")
@@ -367,7 +429,18 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
         )
         # 排队中的后续指令不能提前泄漏给当前轮；只构建截至当前轮的上下文。
         context_turns = [item for item in store.list_turns(session_id) if item.position <= turn.position]
-        context = context_manager.build(context_turns)
+        prior_turns = [item for item in context_turns if item.position < turn.position]
+        reference_turn = next(
+            (item for item in reversed(prior_turns) if item.status in {"finished", "failed", "cancelled", "interrupted"} and not is_continuation_task(item.user_content)),
+            None,
+        )
+        previous_attempt = any(
+            event.turn_id == turn.id and event.type in {EventType.TASK_FAILED, EventType.TASK_CANCELLED, EventType.TASK_FINISHED}
+            for event in store.list_events(session_id)
+        )
+        shared_memory = store.workspace_memory(session.workspace, session_id) if session.cross_session_memory_enabled else ""
+        shared_preferences = store.workspace_preferences(session.workspace, session_id) if session.cross_session_memory_enabled else []
+        context = context_manager.build(context_turns, shared_memory=shared_memory, shared_preferences="\n".join(f"- {item}" for item in shared_preferences))
         store.set_memory_summary(session_id, context.memory_summary)
         client = OpenAICompatibleClient(api_key=effective_settings.api_key, base_url=effective_settings.base_url, model=effective_settings.model)
 
@@ -418,6 +491,11 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
             request_command_approval=request_command_approval,
             cancelled=cancel_event.is_set,
             project_rules=load_project_rules(Workspace(session.workspace).root, min(6000, effective_settings.context_budget_chars // 2)).text,
+            execution_mode=session.agent_mode,
+            agent_config=session.agent_config,
+            memory_metadata={"cross_session_enabled": session.cross_session_memory_enabled, "shared_memory_loaded": bool(shared_memory), "preference_count": len(shared_preferences)},
+            reference_task=reference_turn.user_content if reference_turn else "",
+            resume_existing=previous_attempt or (is_continuation_task(turn.user_content) and reference_turn is not None),
         )
         try:
             completed = await runner.run()

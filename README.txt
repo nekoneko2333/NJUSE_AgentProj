@@ -1,8 +1,11 @@
-项目名称：MossCode 可视化多智能体编程助手
-仓库地址：https://github.com/nekoneko2333/NJUSE_AgentProj
+MossCode - 软件工程专业推免编程智能体
 
-运行方法：复制 .env.example 为 .env，填写 DeepSeek 的 LLM_API_KEY，并修改 APP_USERNAME / APP_PASSWORD。激活 conda 环境 web3d-backend，进入 backend 执行 python -m uvicorn app.main:app --reload --port 8000；进入 frontend 执行 pnpm install、pnpm dev，浏览器访问 http://127.0.0.1:5173。
+Git 仓库：https://github.com/nekoneko2333/NJUSE_AgentProj
 
-主要功能：用户输入本地工作区和开发任务后，Planner、Explorer、Coder、Reviewer 四个角色依次完成规划、只读检索、文件修改、命令验证和独立审查。系统独立实现模型调用、tool calling 解析、本地工具、循环终止和错误处理，不依赖 Agent 框架。SQLite 持久化会话、轮次和事件，支持重启恢复、连续追问及运行中补充消息排队；长上下文采用旧轮摘要、最近三轮和当前任务的有界窗口。GUI 支持本机登录、中英文、明暗主题，以及自动执行、逐条询问或禁用终端命令三种权限模式；内部协作结束后统一输出 Markdown 结果，并展示递归文件树、变更树、逐文件 Diff 与终端命令卡片。文件访问限制在所选工作区，高风险命令、越界路径、超时和重复调用均受控；API Key 仅由未提交的 .env 读取。
+运行：准备 Python/Conda 环境 web3d-backend 与 Node.js。在根目录创建不入库的 .env，配置 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL、APP_USERNAME、APP_PASSWORD。后端执行：cd backend；conda run -n web3d-backend python -m uvicorn app.main:app --port 8001。前端执行：cd frontend；npm install；npm run dev。浏览器访问 http://127.0.0.1:5173。
 
-验证：后端进入 backend 执行 python -m unittest discover -s tests -v；前端进入 frontend 执行 pnpm build。
+特色：项目未使用 LangChain、AutoGen、OpenAI Agents SDK 等 Agent 框架。对话上下文、原生 tool calling 解析、本地文件与命令工具、四角色编排、单 Agent 对照、循环终止、错误恢复和权限审批均自行实现。系统支持 SQLite 持久会话、后台执行、取消与重试、跨对话记忆、文件树与全文搜索、Markdown、多标签编辑、新旧 Diff、检查点恢复、终端授权、AGENTS.md、Hooks、本地 MCP、中英文和双主题。
+
+质量：后端 38 项测试、前端组件测试、TypeScript、生产构建和 Playwright 多尺寸流程均通过。真实模型对照实验中，单 Agent 与四 Agent 各 3 次均通过独立测试；简单明确任务推荐单 Agent，复杂或高风险任务使用四角色独立探索与复核。
+
+注意：提交前需将仓库设为公开；API Key 不得出现在仓库、README 或视频中。
