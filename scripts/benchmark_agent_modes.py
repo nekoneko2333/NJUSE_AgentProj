@@ -19,7 +19,7 @@ sys.path.insert(0, str(BACKEND))
 from app.agents.orchestrator import Orchestrator  # noqa: E402
 from app.core.models import AgentEvent  # noqa: E402
 from app.core.settings import settings  # noqa: E402
-from app.llm.client import OpenAICompatibleClient  # noqa: E402
+from app.llm.client import OpenAICompatibleClient, TaskAnalysis  # noqa: E402
 from app.runtime.workspace import Workspace  # noqa: E402
 from app.tools.registry import ToolRegistry  # noqa: E402
 
@@ -137,6 +137,7 @@ async def run_trial(mode: str, trial: int, workspace: Path) -> dict[str, Any]:
         locale="zh-CN",
         execution_mode=mode,
         command_mode="auto",
+        task_analysis=TaskAnalysis(requires_file_change=True, requires_command=True, adaptive_mode="multi"),
     )
     started = time.perf_counter()
     error = ""

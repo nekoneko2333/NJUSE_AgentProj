@@ -56,8 +56,14 @@ const normalizeWorkflow = (session?: Pick<Session, 'agent_mode' | 'agent_config'
   agent_config:Object.fromEntries((Object.keys(DEFAULT_AGENT_WORKFLOW.agent_config) as AgentRoleName[]).map((role) => [role, { ...DEFAULT_AGENT_WORKFLOW.agent_config[role], ...(session?.agent_config?.[role] ?? {}) }])) as AgentWorkflow['agent_config'],
 })
 
+export function normalizeMarkdownLinks(value: string) {
+  return value
+    .replace(/(\*\*https?:\/\/[^\s*]+\*\*)(?=[（），。；：！？])/g, '$1 ')
+    .replace(/(https?:\/\/[^\s<>()\]）*，。；：！？]+)(?=[（），。；：！？])/g, '$1 ')
+}
+
 function Markdown({ children }: { children: string }) {
-  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown></div>
+  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{normalizeMarkdownLinks(children)}</ReactMarkdown></div>
 }
 
 function buildTree(entries: WorkspaceEntry[]): TreeNode[] {
@@ -347,6 +353,8 @@ export default function App() {
   const launch = async () => {
     if (!task.trim() || !workspace.trim()) return
     const requestedTask = task.trim()
+    followsLatest.current = true
+    setHasNewProgress(false)
     if (busy) {
       if (!sessionId) return
       try {
@@ -375,7 +383,7 @@ export default function App() {
       setSessionWorkspace(session.workspace)
       window.localStorage.setItem('mosscode.lastSession', session.id)
       setTask('')
-      setEvents([])
+      setEvents(session.events)
       setWorkspaceEntries(await getWorkspaceFiles(session.id).catch(() => []))
       close = subscribe(session.id, (event) => {
         if (activeSession.current !== session.id) return
@@ -431,7 +439,7 @@ export default function App() {
   const toolEvents = events.filter((event) => event.type === 'tool_finished')
   const diffEntries = useMemo(() => {
     const latest = new Map<string, string>()
-    toolEvents.filter((event) => event.payload.tool === 'write_file').forEach((event) => {
+    toolEvents.filter((event) => ['write_file', 'replace_text'].includes(String(event.payload.tool))).forEach((event) => {
       const result = event.payload.result as ToolResult
       const path = String(result?.meta?.path ?? '')
       const diff = String(result?.meta?.diff ?? '')

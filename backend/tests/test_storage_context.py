@@ -69,7 +69,7 @@ class StorageContextTests(unittest.TestCase):
             store.update_cross_session_memory(current.id, False)
             self.assertFalse(SQLiteStore(str(Path(directory) / "memory.db")).get_session(current.id).cross_session_memory_enabled)
 
-    def test_workspace_preferences_extracts_names_only_from_same_workspace(self):
+    def test_workspace_history_supplies_raw_preferences_for_api_analysis(self):
         with TemporaryDirectory() as directory, TemporaryDirectory() as other_directory:
             store = SQLiteStore(str(Path(directory) / "preferences.db"))
             source, source_turn = store.create_session(task="以后称呼你为小m，请记住", workspace=directory, locale="zh-CN")
@@ -77,9 +77,10 @@ class StorageContextTests(unittest.TestCase):
             other, other_turn = store.create_session(task="以后叫你别的名字", workspace=other_directory, locale="zh-CN")
             store.update_turn(other_turn.id, status="finished", assistant_summary="收到。")
             current, _ = store.create_session(task="你是谁", workspace=directory, locale="zh-CN", cross_session_memory_enabled=True)
-            preferences = store.workspace_preferences(directory, current.id)
-            self.assertEqual(preferences, ["以后称呼你为小m，请记住"])
-            window = ContextManager().build([], shared_preferences="\n".join(preferences))
+            shared = store.workspace_memory(directory, current.id)
+            self.assertIn("以后称呼你为小m，请记住", shared)
+            self.assertNotIn("以后叫你别的名字", shared)
+            window = ContextManager().build([], shared_preferences="以后称呼你为小m，请记住")
             self.assertIn("必须遵循", window.text)
             self.assertIn("小m", window.text)
 
@@ -93,9 +94,9 @@ class StorageContextTests(unittest.TestCase):
             question = store.append_turn(current.id, "你现在叫什么？", "zh-CN")
             store.update_turn(question.id, status="finished", assistant_summary="旧版本答错为小m。")
 
-            preferences = store.workspace_preferences(directory, current.id)
-            self.assertEqual(preferences, ["你现在改名为小s了"])
-            window = ContextManager().build(store.list_turns(current.id), shared_preferences="\n".join(preferences))
+            shared = store.workspace_memory(directory, current.id)
+            self.assertIn("你现在改名为小s了", shared)
+            window = ContextManager().build(store.list_turns(current.id), shared_preferences="你现在改名为小s了")
             self.assertIn("每类第一条是当前值", window.text)
             self.assertIn("小s", window.text)
             self.assertIn("小m", window.text)  # Older conversation remains available but is explicitly lower priority.

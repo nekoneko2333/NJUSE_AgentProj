@@ -201,37 +201,6 @@ class SQLiteStore:
             for row in matches
         )
 
-    def workspace_preferences(self, workspace: str, _session_id: str, limit: int = 8) -> list[str]:
-        """Return live workspace preferences with the newest naming statement taking precedence.
-
-        Completed turns from the current session are included intentionally: a rename made in
-        another conversation must supersede an older name still present in this conversation.
-        """
-        target = self._workspace_key(workspace)
-        name_markers = ("称呼你", "叫你", "你叫", "改名", "名字是", "名字叫", "call you", "your name is", "rename you")
-        preference_markers = name_markers + ("称呼", "叫我", "我叫", "记住", "偏好", "以后", "请使用", "不要叫", "call me", "remember", "prefer")
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT s.id,s.workspace,t.user_content,t.created_at FROM turns t JOIN sessions s ON s.id=t.session_id WHERE t.status='finished' ORDER BY t.created_at DESC LIMIT 200",
-            ).fetchall()
-        preferences: list[str] = []
-        current_name_found = False
-        for row in rows:
-            content = " ".join(row["user_content"].split()).strip()
-            normalized = content.lower()
-            if self._workspace_key(row["workspace"]) != target or not any(marker in normalized for marker in preference_markers):
-                continue
-            is_name_question = "叫什么" in normalized or "what is your name" in normalized or "what's your name" in normalized
-            is_name_preference = not is_name_question and (any(marker in normalized for marker in name_markers) or ("称呼" in normalized and "你" in normalized))
-            if is_name_preference and current_name_found:
-                continue
-            if content not in preferences:
-                preferences.append(content[:500])
-                current_name_found = current_name_found or is_name_preference
-            if len(preferences) >= max(1, limit):
-                break
-        return preferences
-
     def set_memory_summary(self, session_id: str, summary: str) -> None:
         with self._connection() as connection:
             connection.execute("UPDATE sessions SET memory_summary=?,updated_at=? WHERE id=?", (summary, utc_now(), session_id))

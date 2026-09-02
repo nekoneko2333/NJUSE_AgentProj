@@ -91,7 +91,8 @@ class ToolRegistry:
             begin = max(start - 1, 0)
             finish = min(max(end, begin), len(lines))
             numbered = "\n".join(f"{index + 1}: {line}" for index, line in enumerate(lines[begin:finish], begin))
-            return ToolResult(True, "ok", numbered, {"total_lines": len(lines), "start": begin + 1, "end": finish})
+            content = target.read_text(encoding="utf-8", errors="replace")
+            return ToolResult(True, "ok", numbered, {"path": str(target.relative_to(self.workspace.root)).replace("\\", "/"), "sha256": content_sha256(content), "total_lines": len(lines), "start": begin + 1, "end": finish})
         except WorkspaceError as error:
             return ToolResult(False, str(error), "", {})
 
@@ -135,18 +136,48 @@ class ToolRegistry:
         except WorkspaceError as error:
             return ToolResult(False, str(error), "", {})
 
-    def write_file(self, path: str, content: str) -> ToolResult:
+    def write_file(self, path: str, content: str, expected_sha256: str = "") -> ToolResult:
         try:
             target = self.workspace.resolve(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             existed = target.exists()
             previous = target.read_text(encoding="utf-8", errors="replace") if existed else ""
+            previous_sha256 = content_sha256(previous)
+            if existed and expected_sha256 != previous_sha256:
+                return ToolResult(False, "file_changed", "Read the complete current file and retry with its returned sha256 and the complete updated content.", {"path": path.replace("\\", "/"), "sha256": previous_sha256})
             checkpoint_id = self.checkpoint.capture_before(path, target) if self.checkpoint else ""
             target.write_text(content, encoding="utf-8")
             if self.checkpoint:
                 self.checkpoint.record_after(path, content)
             diff = "\n".join(difflib.unified_diff(previous.splitlines(), content.splitlines(), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""))[:MAX_OUTPUT]
-            return ToolResult(True, "ok", "", {"path": str(target.relative_to(self.workspace.root)), "created": not existed, "previous_bytes": len(previous.encode()), "new_bytes": len(content.encode()), "previous_sha256": content_sha256(previous), "sha256": content_sha256(content), "checkpoint_id": checkpoint_id, "diff": diff})
+            return ToolResult(True, "ok", "", {"path": str(target.relative_to(self.workspace.root)), "created": not existed, "previous_bytes": len(previous.encode()), "new_bytes": len(content.encode()), "previous_sha256": previous_sha256, "sha256": content_sha256(content), "checkpoint_id": checkpoint_id, "diff": diff})
+        except WorkspaceError as error:
+            return ToolResult(False, str(error), "", {})
+
+    def replace_text(self, path: str, old_text: str, new_text: str, expected_sha256: str) -> ToolResult:
+        """Apply one exact, version-checked edit without requiring a full-file rewrite."""
+        if not old_text:
+            return ToolResult(False, "empty_old_text", "", {})
+        try:
+            target = self.workspace.resolve(path)
+            if not target.is_file():
+                return ToolResult(False, "file_not_found", "", {})
+            if target.stat().st_size > MAX_FILE_BYTES:
+                return ToolResult(False, "file_too_large", "", {"max_bytes": MAX_FILE_BYTES})
+            previous = target.read_text(encoding="utf-8", errors="replace")
+            previous_sha256 = content_sha256(previous)
+            if expected_sha256 != previous_sha256:
+                return ToolResult(False, "file_changed", "Read the current file and retry with its returned sha256.", {"path": path.replace("\\", "/"), "sha256": previous_sha256})
+            matches = previous.count(old_text)
+            if matches != 1:
+                return ToolResult(False, "text_not_unique" if matches else "text_not_found", "old_text must match exactly once.", {"path": path.replace("\\", "/"), "matches": matches})
+            content = previous.replace(old_text, new_text, 1)
+            checkpoint_id = self.checkpoint.capture_before(path, target) if self.checkpoint else ""
+            target.write_text(content, encoding="utf-8")
+            if self.checkpoint:
+                self.checkpoint.record_after(path, content)
+            diff = "\n".join(difflib.unified_diff(previous.splitlines(), content.splitlines(), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""))[:MAX_OUTPUT]
+            return ToolResult(True, "ok", "", {"path": str(target.relative_to(self.workspace.root)), "created": False, "previous_bytes": len(previous.encode()), "new_bytes": len(content.encode()), "previous_sha256": previous_sha256, "sha256": content_sha256(content), "checkpoint_id": checkpoint_id, "diff": diff})
         except WorkspaceError as error:
             return ToolResult(False, str(error), "", {})
 

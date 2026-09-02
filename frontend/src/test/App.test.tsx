@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import App, { selectDisplayEvents } from '../App'
+import App, { normalizeMarkdownLinks, selectDisplayEvents } from '../App'
 
 const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 
@@ -14,6 +14,8 @@ describe('App conversation stability', () => {
       if (url.endsWith('/auth/status')) return json({ authenticated: true, username: 'moss' })
       if (url.endsWith('/sessions')) return json([{ id:'session-1', title:'测试', task:'原任务', workspace:'C:\\workspace', locale:'zh-CN', status:'finished', updated_at:'now', turn_count:1, command_mode:'auto', cross_session_memory_enabled:false, agent_mode:'multi' }])
       if (url.endsWith('/sessions/session-1')) return json({ id:'session-1', title:'测试', task:'追加任务', workspace:'C:\\workspace', locale:'zh-CN', status:'finished', memory_summary:'', created_at:'now', updated_at:'now', command_mode:'auto', cross_session_memory_enabled:false, agent_mode:'multi', agent_config:{}, turns:[], events:[{ type:'task_created', session_id:'session-1', turn_id:'turn-1', summary:'', payload:{ task:'原任务', position:1 } }, { type:'task_finished', session_id:'session-1', turn_id:'turn-1', summary:'最终答复', payload:{} }, { type:'task_created', session_id:'session-1', turn_id:'turn-2', summary:'', payload:{ task:'追加任务', position:2 } }, { type:'task_finished', session_id:'session-1', turn_id:'turn-2', summary:'第二轮答复', payload:{} }] })
+      if (url.endsWith('/sessions/session-1/turns')) return json({ id:'session-1', title:'测试', task:'追加任务', workspace:'C:\\workspace', locale:'zh-CN', status:'pending', memory_summary:'', created_at:'now', updated_at:'now', command_mode:'auto', cross_session_memory_enabled:false, agent_mode:'multi', agent_config:{}, turns:[], events:[{ type:'task_created', session_id:'session-1', turn_id:'turn-1', summary:'', payload:{ task:'原任务', position:1 } }, { type:'task_finished', session_id:'session-1', turn_id:'turn-1', summary:'最终答复', payload:{} }, { type:'task_created', session_id:'session-1', turn_id:'turn-2', summary:'', payload:{ task:'追加任务', position:2 } }] })
+      if (url.endsWith('/sessions/session-1/executions')) return json({ id:'execution-1', session_id:'session-1', turn_id:'turn-2', status:'succeeded', reason:'', created_at:'now', updated_at:'now' })
       if (url.endsWith('/sessions/session-1/command-mode')) return json({ id:'session-1', title:'测试', task:'追加任务', workspace:'C:\\workspace', locale:'zh-CN', status:'finished', memory_summary:'', created_at:'now', updated_at:'now', command_mode:'ask', turns:[], events:[] })
       if (url.endsWith('/sessions/session-1/cross-session-memory')) return json({ cross_session_memory_enabled:true })
       if (url.endsWith('/sessions/session-1/agent-workflow')) return json({ agent_mode:'single' })
@@ -39,6 +41,17 @@ describe('App conversation stability', () => {
     await userEvent.click(within(navigator).getByRole('button', { name:'跳转到第 2 轮发言' }))
   })
 
+  it('keeps history mounted when a follow-up is submitted', async () => {
+    render(<App/>)
+    await screen.findByText('最终答复')
+    const message = document.querySelector('.final-response')
+    const editor = screen.getByPlaceholderText(/继续追问/)
+    await userEvent.type(editor, '继续修复')
+    await userEvent.click(document.querySelector('.send-button') as HTMLButtonElement)
+    await waitFor(() => expect(screen.getByText('最终答复')).toBeInTheDocument())
+    expect(document.querySelector('.final-response')).toBe(message)
+  })
+
   it('uses a styled accessible menu instead of a native select', async () => {
     render(<App/>)
     const trigger = await screen.findByRole('button', { name:'终端权限：自动执行安全命令' })
@@ -60,11 +73,19 @@ describe('App conversation stability', () => {
     expect(document.querySelector('.conversation')).toBeInTheDocument()
     expect(screen.getAllByText('跨对话项目记忆')).toHaveLength(1)
     await userEvent.click(screen.getByRole('button', { name:/Agent 编排与对比/ }))
+    expect(screen.getByRole('button', { name:/四 Agent.*分工协作/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.queryByRole('switch', { name:'启用或关闭角色' })).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name:/单 Agent.*对照基线/ }))
+    expect(screen.getByRole('button', { name:/单 Agent.*对照基线/ })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByText('单 Agent 使用相同模型、工具和验证门槛，可作为四角色编排的公平基线。')).toBeInTheDocument()
     expect(screen.getByRole('spinbutton', { name:'最大轮次' })).toHaveValue(12)
     await userEvent.click(screen.getByRole('button', { name:'保存 Agent 编排' }))
     await waitFor(() => expect(screen.getByText('Agent 编排已保存，将从下一轮执行生效。')).toBeInTheDocument())
+  })
+
+  it('keeps Chinese punctuation outside bare and bold URLs', () => {
+    expect(normalizeMarkdownLinks('前端是 **http://localhost:8765/**（或 http://127.0.0.1:8765/），由 FastAPI 返回。')).toBe('前端是 **http://localhost:8765/** （或 http://127.0.0.1:8765/ ），由 FastAPI 返回。')
+    expect(normalizeMarkdownLinks('API：http://localhost:8765/api/。')).toBe('API：http://localhost:8765/api/ 。')
   })
 
   it('shows only the latest attempt progress and terminal result after retry', () => {

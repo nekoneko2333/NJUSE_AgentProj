@@ -18,7 +18,7 @@ from app.core.checkpoints import CheckpointManager, content_sha256
 from app.core.extensions import HookConfig, MCPManager, load_project_rules
 from app.core.models import AgentEvent, AgentRole, AppendTurnRequest, ApprovalDecisionRequest, CheckpointSnapshot, CreateTaskRequest, EventType, ExecutionSnapshot, FileWriteRequest, LoginRequest, ModelSettingsRequest, ProjectConfigWriteRequest, SessionListItem, SessionSnapshot, UpdateAgentWorkflowRequest, UpdateCommandModeRequest, UpdateCrossSessionMemoryRequest
 from app.core.settings import settings
-from app.agents.orchestrator import ORCHESTRATOR_PROTOCOL, Orchestrator, is_continuation_task, normalize_agent_config
+from app.agents.orchestrator import ORCHESTRATOR_PROTOCOL, Orchestrator, continuation_lineage_has_successful_write, normalize_agent_config, turn_has_successful_write
 from app.llm.client import OpenAICompatibleClient, LLMError
 from app.runtime.workspace import Workspace, WorkspaceError
 from app.storage.sqlite_store import SQLiteStore
@@ -218,7 +218,7 @@ async def update_project_config(session_id: str, payload: ProjectConfigWriteRequ
     if str(current["sha256"]) != payload.expected_sha256:
         raise HTTPException(409, detail="file_changed")
     checkpoint = CheckpointManager(checkpoint_root, store, session_id, None, f"更新项目配置 {path}")
-    result = ToolRegistry(workspace, checkpoint=checkpoint).write_file(path, payload.content)
+    result = ToolRegistry(workspace, checkpoint=checkpoint).write_file(path, payload.content, payload.expected_sha256)
     if not result.ok:
         raise HTTPException(422, detail=result.code)
     await publish(AgentEvent(type=EventType.CHECKPOINT_CREATED, session_id=session_id, summary="已更新项目配置并创建检查点。", payload={"checkpoint_id": result.meta.get("checkpoint_id"), "path": path}))
@@ -260,7 +260,7 @@ async def update_file_content(session_id: str, payload: FileWriteRequest, _user:
     if current.meta.get("sha256") != payload.expected_sha256:
         raise HTTPException(409, detail="file_changed")
     manager = CheckpointManager(checkpoint_root, store, session_id, None, f"用户编辑 {payload.path}")
-    result = ToolRegistry(workspace, checkpoint=manager).write_file(payload.path, payload.content)
+    result = ToolRegistry(workspace, checkpoint=manager).write_file(payload.path, payload.content, payload.expected_sha256)
     if not result.ok:
         raise HTTPException(422, detail=result.code)
     await publish(AgentEvent(type=EventType.CHECKPOINT_CREATED, session_id=session_id, summary="已为用户编辑创建检查点。", payload={"checkpoint_id": result.meta.get("checkpoint_id"), "path": payload.path}))
@@ -431,21 +431,50 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
         context_turns = [item for item in store.list_turns(session_id) if item.position <= turn.position]
         prior_turns = [item for item in context_turns if item.position < turn.position]
         reference_turn = next(
-            (item for item in reversed(prior_turns) if item.status in {"finished", "failed", "cancelled", "interrupted"} and not is_continuation_task(item.user_content)),
+            (item for item in reversed(prior_turns) if item.status in {"finished", "failed", "cancelled", "interrupted"}),
             None,
         )
+        session_events = store.list_events(session_id)
         previous_attempt = any(
             event.turn_id == turn.id and event.type in {EventType.TASK_FAILED, EventType.TASK_CANCELLED, EventType.TASK_FINISHED}
-            for event in store.list_events(session_id)
+            for event in session_events
+        )
+        retained_write = turn_has_successful_write(session_events, turn.id)
+        reference_retained_write = continuation_lineage_has_successful_write(
+            session_events,
+            [item.id for item in reversed(prior_turns)],
         )
         shared_memory = store.workspace_memory(session.workspace, session_id) if session.cross_session_memory_enabled else ""
-        shared_preferences = store.workspace_preferences(session.workspace, session_id) if session.cross_session_memory_enabled else []
-        context = context_manager.build(context_turns, shared_memory=shared_memory, shared_preferences="\n".join(f"- {item}" for item in shared_preferences))
+        context = context_manager.build(context_turns, shared_memory=shared_memory)
         store.set_memory_summary(session_id, context.memory_summary)
         client = OpenAICompatibleClient(api_key=effective_settings.api_key, base_url=effective_settings.base_url, model=effective_settings.model)
 
         async def publish_turn(event: AgentEvent) -> None:
             await publish(event.model_copy(update={"turn_id": turn.id}))
+
+        try:
+            task_analysis = await client.analyze_task(
+                task=turn.user_content,
+                conversation_context=context.text,
+                requested_mode=session.agent_mode,
+            )
+        except LLMError as error:
+            await publish_turn(AgentEvent(
+                type=EventType.TASK_FAILED,
+                session_id=session_id,
+                summary="任务语义分析失败，本轮没有执行工具或修改文件。",
+                payload={"reason": str(error)},
+            ))
+            store.update_turn(turn.id, status="failed", assistant_summary=str(error))
+            store.update_execution(execution_id, "failed", str(error))
+            return
+        shared_preferences = list(task_analysis.workspace_preferences) if session.cross_session_memory_enabled else []
+        context = context_manager.build(
+            context_turns,
+            shared_memory=shared_memory,
+            shared_preferences="\n".join(f"- {item}" for item in shared_preferences),
+        )
+        store.set_memory_summary(session_id, context.memory_summary)
 
         async def request_command_approval(role: AgentRole, command: str, cwd: str) -> bool:
             approval_id = str(uuid4())
@@ -495,7 +524,10 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
             agent_config=session.agent_config,
             memory_metadata={"cross_session_enabled": session.cross_session_memory_enabled, "shared_memory_loaded": bool(shared_memory), "preference_count": len(shared_preferences)},
             reference_task=reference_turn.user_content if reference_turn else "",
-            resume_existing=previous_attempt or (is_continuation_task(turn.user_content) and reference_turn is not None),
+            # Retry 可复用同一轮写入；明确续跑还可复用它所引用的上一终态轮写入。
+            # 两者都以持久化工具成功事件为依据，不按自然语言关键词猜测。
+            resume_existing=(previous_attempt and retained_write) or (task_analysis.continuation and reference_retained_write),
+            task_analysis=task_analysis,
         )
         try:
             completed = await runner.run()
