@@ -267,6 +267,15 @@ class SQLiteStore:
             connection.execute("UPDATE executions SET status=?,reason=?,updated_at=? WHERE id=?", (status, reason, utc_now(), execution_id))
         return self.get_execution(execution_id)
 
+    def update_execution_turn(self, execution_id: str, turn_id: str) -> ExecutionSnapshot:
+        """Execution 可连续清空队列；turn_id 始终指向此刻真正处理的轮次。"""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE executions SET turn_id=?,updated_at=? WHERE id=?",
+                (turn_id, utc_now(), execution_id),
+            )
+        return self.get_execution(execution_id)
+
     def retry_turn(self, turn_id: str) -> ConversationTurn:
         turn = self.get_turn(turn_id)
         if turn.status not in {"failed", "cancelled", "interrupted"}:

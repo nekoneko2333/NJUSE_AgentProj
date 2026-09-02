@@ -51,6 +51,16 @@ export function selectDisplayEvents(events: AgentEvent[]) {
     return latestMilestones.get(`${turnKey}:${tool}`) === sourceIndex
   })
 }
+
+export function getTurnQueueState(events: AgentEvent[], activeTurnId: string | null) {
+  const created = new Set(events.filter((event) => event.type === 'task_created' && event.turn_id).map((event) => event.turn_id!))
+  events.filter((event) => terminalEventTypes.has(event.type) && event.turn_id).forEach((event) => created.delete(event.turn_id!))
+  const activeTurnEvent = events.find((event) => event.type === 'task_created' && event.turn_id === activeTurnId)
+  return {
+    activeTurnPosition:Number(activeTurnEvent?.payload.position ?? 0),
+    queuedCount:[...created].filter((turnId) => turnId !== activeTurnId).length,
+  }
+}
 const normalizeWorkflow = (session?: Pick<Session, 'agent_mode' | 'agent_config'>): AgentWorkflow => ({
   agent_mode:session?.agent_mode ?? DEFAULT_AGENT_WORKFLOW.agent_mode,
   agent_config:Object.fromEntries((Object.keys(DEFAULT_AGENT_WORKFLOW.agent_config) as AgentRoleName[]).map((role) => [role, { ...DEFAULT_AGENT_WORKFLOW.agent_config[role], ...(session?.agent_config?.[role] ?? {}) }])) as AgentWorkflow['agent_config'],
@@ -99,6 +109,7 @@ export default function App() {
   const [selectedDiff, setSelectedDiff] = useState('')
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [executionId, setExecutionId] = useState<string | null>(null)
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null)
   const [retryableTurnId, setRetryableTurnId] = useState<string | null>(null)
   const [sessionWorkspace, setSessionWorkspace] = useState('')
   const [sessionItems, setSessionItems] = useState<SessionListItem[]>([])
@@ -258,7 +269,10 @@ export default function App() {
       setBusy(true)
       setStartedAt(Number.isFinite(Date.parse(session.updated_at)) ? Date.parse(session.updated_at) : Date.now())
       const latestExecution = await getLatestExecution(session.id).catch(() => null)
-      if (latestExecution && ['queued', 'running', 'waiting_approval', 'cancel_requested'].includes(latestExecution.status)) setExecutionId(latestExecution.id)
+      if (latestExecution && ['queued', 'running', 'waiting_approval', 'cancel_requested'].includes(latestExecution.status)) {
+        setExecutionId(latestExecution.id)
+        setActiveTurnId(latestExecution.turn_id)
+      }
       let polling = false
       pollTimer.current = window.setInterval(async () => {
         if (polling) return
@@ -267,8 +281,12 @@ export default function App() {
           const refreshed = await getSession(session.id)
           if (activeSession.current !== session.id || version !== loadVersion.current) return
           setEvents(refreshed.events); setSubmittedTask(refreshed.task)
+          if (latestExecution) {
+            const currentExecution = await getExecution(latestExecution.id).catch(() => null)
+            if (currentExecution) setActiveTurnId(currentExecution.turn_id)
+          }
           if (refreshed.status !== 'running') {
-            stopPolling(); setBusy(false); setStartedAt(null); setExecutionId(null)
+            stopPolling(); setBusy(false); setStartedAt(null); setExecutionId(null); setActiveTurnId(null)
             setWorkspaceEntries(await getWorkspaceFiles(session.id).catch(() => []))
             await refreshSessions()
           }
@@ -277,7 +295,7 @@ export default function App() {
         } finally { polling = false }
       }, 2000)
     } else {
-      setBusy(false); setStartedAt(null); setExecutionId(null)
+      setBusy(false); setStartedAt(null); setExecutionId(null); setActiveTurnId(null)
     }
   }
 
@@ -285,7 +303,7 @@ export default function App() {
     if (busy) return
     stopPolling()
     loadVersion.current += 1; activeSession.current = null
-    setSessionId(null); setSessionWorkspace(''); setTask(''); setSubmittedTask(''); setEvents([]); setWorkspaceEntries([]); setSelectedDiff(''); setError(''); setSettingsOpen(false)
+    setSessionId(null); setSessionWorkspace(''); setTask(''); setSubmittedTask(''); setEvents([]); setWorkspaceEntries([]); setSelectedDiff(''); setError(''); setSettingsOpen(false); setActiveTurnId(null)
     window.localStorage.removeItem('mosscode.lastSession')
   }
 
@@ -307,7 +325,7 @@ export default function App() {
   const submitLogout = async () => {
     await logout().catch(() => undefined)
     stopPolling(); loadVersion.current += 1; activeSession.current = null
-    setAuthenticated(false); setUsername(''); setSessionId(null); setEvents([]); setWorkspaceEntries([])
+    setAuthenticated(false); setUsername(''); setSessionId(null); setEvents([]); setWorkspaceEntries([]); setActiveTurnId(null)
   }
 
   const changeCommandMode = async (mode: CommandMode) => {
@@ -391,9 +409,11 @@ export default function App() {
       })
       let execution = await runAgent(session.id)
       setExecutionId(execution.id)
+      setActiveTurnId(execution.turn_id)
       while (['queued', 'running', 'waiting_approval', 'cancel_requested'].includes(execution.status)) {
         await new Promise((resolve) => window.setTimeout(resolve, 500))
         execution = await getExecution(execution.id)
+        setActiveTurnId(execution.turn_id)
       }
       close()
       const refreshed = await getSession(session.id)
@@ -408,7 +428,7 @@ export default function App() {
         const code = reason instanceof Error ? reason.message : String(reason)
         setError(t(`errors.${code}`, { defaultValue: code }))
       }
-    } finally { setBusy(false); setStartedAt(null); setExecutionId(null) }
+    } finally { setBusy(false); setStartedAt(null); setExecutionId(null); setActiveTurnId(null) }
   }
 
   const retryFailedTurn = useCallback(async (turnId: string) => {
@@ -421,9 +441,11 @@ export default function App() {
     try {
       let execution = await retryTurn(turnId)
       setExecutionId(execution.id)
+      setActiveTurnId(execution.turn_id)
       while (['queued', 'running', 'waiting_approval', 'cancel_requested'].includes(execution.status)) {
         await new Promise((resolve) => window.setTimeout(resolve, 500))
         execution = await getExecution(execution.id)
+        setActiveTurnId(execution.turn_id)
       }
       const refreshed = await getSession(sessionId)
       setEvents(refreshed.events); setSubmittedTask(refreshed.task)
@@ -433,7 +455,7 @@ export default function App() {
     } catch (reason) {
       const code = reason instanceof Error ? reason.message : String(reason)
       setError(reason instanceof TypeError ? t('networkError') : t(`errors.${code}`, { defaultValue: code }))
-    } finally { close(); setBusy(false); setStartedAt(null); setExecutionId(null) }
+    } finally { close(); setBusy(false); setStartedAt(null); setExecutionId(null); setActiveTurnId(null) }
   }, [busy, sessionId, t])
 
   const toolEvents = events.filter((event) => event.type === 'tool_finished')
@@ -457,7 +479,8 @@ export default function App() {
   const activeDiff = diffEntries.find((entry) => entry.path === selectedDiff) ?? diffEntries[0]
   const displayEvents = useMemo(() => selectDisplayEvents(events), [events])
   const hasStoredUserEvents = events.some((event) => event.type === 'task_created' && typeof event.payload.task === 'string')
-  const queuedCount = Math.max(0, events.filter((event) => event.type === 'task_created').length - events.filter((event) => event.type === 'task_finished' || event.type === 'task_failed').length - (busy ? 1 : 0))
+  const { queuedCount, activeTurnPosition } = useMemo(() => getTurnQueueState(events, activeTurnId), [events, activeTurnId])
+  const activeProgressLabel = activeTurnPosition > 0 ? t('processingTurn', { count:activeTurnPosition }) : t('agentThinking')
   const workspaceChanged = Boolean(sessionId) && normalizePath(workspace) !== normalizePath(sessionWorkspace)
   const commandModeOptions = useMemo(() => ([
     { value:'auto' as CommandMode, label:t('permissions.auto'), description:t('permissions.autoMenuDetail') },
@@ -504,7 +527,7 @@ export default function App() {
           {!submittedTask && <div className="welcome"><span><Sparkles size={24}/></span><h3>{t('welcome')}</h3><p>{t('welcomeDetail')}</p></div>}
           {submittedTask && !hasStoredUserEvents && <article className="message user-message" data-user-turn="initial" data-turn-label="1"><div className="message-label">{t('you')}</div><p>{submittedTask}</p></article>}
           {displayEvents.map(({ event, sourceIndex }) => <EventMessage event={event} events={events} onApprovalError={reportApprovalError} onRetry={retryFailedTurn} retryDisabled={busy} key={`${event.turn_id ?? 'session'}-${event.type}-${sourceIndex}`} />)}
-          {busy && <div className="thinking"><LoaderCircle size={16}/><span>{t('agentThinking')} · {t('elapsed', { time: formatElapsed(elapsedSeconds) })}{queuedCount > 0 ? ` · ${t('queuedCount', { count: queuedCount })}` : ''}</span></div>}
+          {busy && <div className="thinking" data-active-turn={activeTurnId ?? undefined}><LoaderCircle size={16}/><span>{activeProgressLabel} · {t('elapsed', { time: formatElapsed(elapsedSeconds) })}{queuedCount > 0 ? ` · ${t('queuedCount', { count: queuedCount })}` : ''}</span></div>}
           {error && <article className="message error-message" role="alert"><CircleAlert size={17}/><div><strong>{t('runFailed')}</strong><p>{error}</p>{retryableTurnId && <button className="retry-button" type="button" disabled={busy} onClick={() => void retryFailedTurn(retryableTurnId)}><Redo2 size={13}/>{t('retryRun')}</button>}</div></article>}
         </div>
         {conversationMarkers.length > 0 && <nav className="conversation-rail" aria-label={t('conversationNavigator')}>{conversationMarkers.map((marker) => <button type="button" className={activeUserTurn === marker.id ? 'active' : ''} style={{ '--marker-top': marker.top } as React.CSSProperties} title={t('jumpToTurn', { count: marker.label })} aria-label={t('jumpToTurn', { count: marker.label })} onClick={() => jumpToUserTurn(marker.id)} key={marker.id}><span/></button>)}</nav>}
@@ -555,7 +578,7 @@ const EventMessage = memo(function EventMessage({ event, events, onApprovalError
   if (event.type === 'approval_resolved') return null
   if (event.type === 'task_cancelled') return <article className="message completion cancelled-message"><CircleX size={17}/><div><strong>{t('runCancelled')}</strong><p>{t('runCancelledDetail')}</p>{event.turn_id && <button className="retry-button" type="button" disabled={retryDisabled} onClick={() => void onRetry(event.turn_id!)}><Redo2 size={13}/>{t('retryRun')}</button>}</div></article>
   if (event.type === 'task_failed') { const reason = String(event.payload.reason ?? event.summary); const detail = String(event.payload.content ?? ''); return <article className="message error-message"><CircleAlert size={17}/><div><strong>{t('runFailed')}{position > 0 ? ` · ${t('turnLabel', { count: position })}` : ''}</strong><p>{t(`errors.${reason}`, { defaultValue: reason })}</p>{detail && <Markdown>{detail}</Markdown>}{event.turn_id && <button className="retry-button" type="button" disabled={retryDisabled} onClick={() => void onRetry(event.turn_id!)}><Redo2 size={13}/>{t('retryRun')}</button>}</div></article> }
-  if (event.type === 'task_finished') return <article className="message assistant-message final-response"><div className="assistant-avatar"><Bot size={16}/></div><div className="assistant-body"><div className="message-label">{t('appName')}</div><Markdown>{event.summary}</Markdown></div></article>
+  if (event.type === 'task_finished') return <article className="message assistant-message final-response"><div className="assistant-avatar"><Bot size={16}/></div><div className="assistant-body"><div className="message-label">{t('appName')}{position > 0 ? ` · ${t('turnLabel', { count:position })}` : ''}</div><Markdown>{event.summary}</Markdown></div></article>
   return null
 })
 

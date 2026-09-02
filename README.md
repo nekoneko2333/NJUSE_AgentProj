@@ -8,8 +8,8 @@ MossCode 是一个面向本地软件工程任务的多智能体编程工作台�
 
 目前已经实现可实际运行的前后端系统，而非静态界面或一次性模型演示：
 
-- 可配置 Agent 编排：四角色串行、单 Agent 对照基线与按任务复杂度选择的自适应模式。
-- Planner、Explorer、Reviewer 支持独立启停，并可配置角色轮次与附加指令；Coder/单 Agent 的执行职责和工具权限由后端强制。
+- 三种 Agent 模式：固定有界的四角色流程、单 Agent 对照基线，以及按任务复杂度选择实际流程的自适应模式。
+- 多 Agent 的角色顺序、轮次、工具调用、交接上下文与返工次数由后端统一约束；设置页仅允许补充角色关注点，旧配置不能关闭必要角色。
 - SQLite 持久化会话、轮次、事件、后台执行、审批和检查点索引，刷新或重启后可恢复。
 - 后台 Execution 状态机支持排队、执行、等待审批、取消、失败、重试和中断恢复。
 - Agent 可在用户指定的本机工作区中搜索、读取、修改文件并运行安全命令。
@@ -22,26 +22,27 @@ MossCode 是一个面向本地软件工程任务的多智能体编程工作台�
 
 ### 多 Agent 编排
 
-设置页可选择“四 Agent / 单 Agent / 自适应”。单 Agent 与四 Agent 共用模型、工具、安全边界和验证门槛，方便进行公平 A/B 对照；自适应模式会在执行前根据任务复杂度选择实际流程，并在事件中记录选择结果。旧会话会通过 SQLite 自动迁移获得默认四角色配置。
+设置页可选择“四 Agent / 单 Agent / 自适应”。单 Agent 与四 Agent 共用模型、工具和安全边界，方便进行公平 A/B 对照；自适应模式会根据任务语义选择实际流程并记录在执行事件中。多 Agent 始终运行固定状态机：`规划 → 探索 → 实施 → 审查 → 可选的一次返工 → 收尾`，旧会话中遗留的角色开关或轮次值不会裁掉流程节点。
 
 | 角色 | 职责 | 默认工具能力 |
 | --- | --- | --- |
 | Planner | 整理用户明确提出的验收条件，不扩张范围 | 不调用本地工具 |
 | Explorer | 调查项目结构并向实现者报告事实 | 文件列表、读取、全文搜索 |
 | Coder | 实施修改并运行必要验证 | 列表、读取、搜索、写入、命令执行 |
-| Reviewer | 向主编排器提交受约束的只读复核意见 | 列表、读取、搜索；缺少命令证据时才可验证 |
+| Reviewer | 通过结构化审查 API 核对冻结验收项与证据账本 | 不重复操作工作区 |
 
 角色的中间 JSON、工具参数和内部讨论不会直接倾倒给用户。聊天区以自然语言显示阶段性进度、已用时间和最终 Markdown 总结；详细工具记录保留在可折叠区域中，兼顾可读性与可追溯性。
 
 编排器还包含以下工程约束：
 
 - 解析原生 tool call 与兼容格式，统一校验工具参数。
-- 限制角色轮次、检查预算和重复工具调用，避免无限循环。
+- 固定预算：Planner 1 轮；Explorer 4 轮、4 次工具；Coder 8 轮、10 次工具且最多 4 次探查；Reviewer 1 次；返工最多 1 次、5 轮、6 次工具。
+- 单次模型响应产生超额工具调用时，只保留预算内部分，其余整体截断并记入事件，避免事件风暴和长时间空转。
+- 交接上下文最多 3,000 字符，结构化审查证据最多 4,000 字符，状态机最多经过 7 个非终止节点。
 - 在模型请求、工具调用和角色切换前检查取消信号。
-- 主编排器持有任务结果与最终状态，Reviewer 只是只读顾问，不能直接把一次模型意见提升为用户可见失败。验收范围冻结为用户原始要求；Planner、Explorer 和 Reviewer 都不能新增可选规范。
-- Reviewer 的拒绝必须同时给出 `BASIS`、`EVIDENCE` 和 `ACTION`，依据只能是明确用户要求、真实失败验证或本轮回归。缺少可追溯依据的范围漂移不会触发返工。
-- 合法 `NEEDS_WORK` 会把唯一待办和完整运行证据交回 Coder，最多进行五次内部“修复—验证—聚焦复审”；复审只检查上一项问题和同一验证暴露的回归，不重新进行全项目审计。
-- 文件写入和命令结果会形成不可裁剪的运行时证据摘要；已有 Coder 命令证据时 Reviewer 不再重复运行同一测试或重复触发授权。只有耗尽内部修复且权威验证仍失败，才向用户报告任务失败。
+- 主编排器持有任务结果与最终状态，Reviewer 只是受约束的评估节点。验收范围冻结为用户原始要求；Planner、Explorer 和 Reviewer 都不能新增可选规范。
+- 生产流程只发起一次结构化审查；若存在明确缺口，只把未闭环验收项交回 Coder 定向返工一次，返工后由新的类型化工具证据确定性收口，不再启动无限复审。
+- 文件写入、命令和最终回复形成有界证据账本；只有耗尽唯一一次返工且权威证据仍不完整时，才向用户报告任务失败。
 - 兜底完成会记录 `completion_source=structured_evidence`，不会伪装成 Reviewer 正常通过。
 
 ### 持久对话与长上下文
@@ -139,11 +140,12 @@ FastAPI Backend
 ├── Auth 与 Session API
 ├── SQLite Store 与 Context Manager
 ├── Background Execution 状态机
-├── Multi-Agent Orchestrator
-│   ├── Planner
-│   ├── Explorer
-│   ├── Coder
-│   └── Reviewer
+├── Bounded Multi-Agent State Graph
+│   ├── Planner（1 轮）
+│   ├── Explorer（4 轮 / 4 次工具）
+│   ├── Coder（8 轮 / 10 次工具）
+│   ├── Reviewer（1 次结构化审查）
+│   └── Focused Repair（最多 1 次）
 ├── Tool Registry / Approval / Hooks / MCP
 └── Workspace Guard / Checkpoint Manager
                  │
@@ -155,9 +157,9 @@ FastAPI Backend
 
 1. 用户选择工作区并发送任务，后端创建持久化 Execution。
 2. 上下文管理器组合会话摘要、近期轮次、项目规则和当前输入。
-3. 四个角色依次工作；工具调用先经过角色白名单、路径边界和命令安全检查。
+3. 固定状态机依次进入 Planner、Explorer、Coder 和 Reviewer；工具调用先经过角色白名单、路径边界、命令安全检查和角色硬预算。
 4. 文件首次写入前创建检查点，写入和命令结果持续记录为事件并通过 SSE 推送。
-5. Reviewer 向主编排器提交带依据的复核意见；主编排器决定是否让 Coder 聚焦修复，最终依据冻结验收范围和结构化运行证据终止循环。
+5. Reviewer 通过一次结构化调用核对冻结验收项；若存在明确缺口，主编排器允许 Coder 定向返工一次，并根据返工后的新证据确定性终止流程。
 6. 前端输出一条统一的 Markdown 总结，并提供 Diff、日志和恢复入口。
 
 ## 目录结构
@@ -217,7 +219,7 @@ DEFAULT_WORKSPACE=
 conda activate web3d-backend
 pip install -r backend/requirements.txt
 cd backend
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8001
 ```
 
 ### 4. 启动前端
@@ -271,7 +273,7 @@ cd frontend
 pnpm test:e2e
 ```
 
-当前验收基线：后端 38 项测试、前端 3 个组件测试文件共 6 项测试、1 条 Playwright 多尺寸全栈流程，以及 TypeScript 检查和生产构建全部通过。自动化测试使用临时数据库与 demo 模型，不读取真实 API Key，不修改 `style/prompt.xml`，也不会操作测试工作区以外的文件。
+当前验收基线：后端 76 项测试、前端 3 个组件测试文件共 10 项测试、1 条 Playwright 多尺寸全栈流程，以及 TypeScript 检查和生产构建全部通过。自动化测试使用临时数据库与 demo 模型，不读取真实 API Key，不修改 `style/prompt.xml`，也不会操作测试工作区以外的文件。
 
 单 Agent / 四 Agent 的真实模型对照可运行：
 
@@ -295,7 +297,7 @@ conda run -n web3d-backend python scripts/benchmark_agent_modes.py --repeats 3
 当前版本已经形成完整的本地 AgentCode 闭环，后续可继续向以下竞品级能力演进：
 
 1. 使用 Git worktree 隔离并行任务，并支持多方案对比。
-2. 动态 Agent 配置、按角色选模型和只读并行 Explorer。
+2. 按角色选择模型、Git worktree 隔离，以及可证明安全的只读并行 Explorer。
 3. Skills / 插件包、MCP 管理界面和本地工具市场。
 4. GitHub Issue、Pull Request、CI、CodeQL 与 secret scanning 集成。
 5. 云端后台执行、移动端查看和本地/云端任务交接。

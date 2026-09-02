@@ -410,6 +410,7 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
     store.update_execution(execution_id, "running")
     processed = 0
     while turn := store.pending_turn(session_id):
+        store.update_execution_turn(execution_id, turn.id)
         if cancel_event.is_set():
             await publish(AgentEvent(type=EventType.TASK_CANCELLED, session_id=session_id, turn_id=turn.id, summary="本轮任务已由用户取消。", payload={"reason": "cancelled_by_user"}))
             store.update_turn(turn.id, status="cancelled", assistant_summary="cancelled_by_user")
@@ -459,14 +460,15 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
                 requested_mode=session.agent_mode,
             )
         except LLMError as error:
+            message = error.user_message(session.locale)
             await publish_turn(AgentEvent(
                 type=EventType.TASK_FAILED,
                 session_id=session_id,
-                summary="任务语义分析失败，本轮没有执行工具或修改文件。",
-                payload={"reason": str(error)},
+                summary=message,
+                payload={"reason": error.code, "status_code": error.status_code, "retryable": error.retryable, "stage": "task_analysis"},
             ))
-            store.update_turn(turn.id, status="failed", assistant_summary=str(error))
-            store.update_execution(execution_id, "failed", str(error))
+            store.update_turn(turn.id, status="failed", assistant_summary=message)
+            store.update_execution(execution_id, "failed", error.code)
             return
         shared_preferences = list(task_analysis.workspace_preferences) if session.cross_session_memory_enabled else []
         context = context_manager.build(
@@ -537,8 +539,8 @@ async def _process_execution(execution_id: str, session_id: str, cancel_event: t
             store.update_execution(execution_id, "cancelled", "cancelled_by_user")
             return
         except LLMError as error:
-            store.update_turn(turn.id, status="failed", assistant_summary=str(error))
-            store.update_execution(execution_id, "failed", str(error))
+            store.update_turn(turn.id, status="failed", assistant_summary=error.user_message(session.locale))
+            store.update_execution(execution_id, "failed", error.code)
             return
         except Exception:
             await publish_turn(AgentEvent(type=EventType.TASK_FAILED, session_id=session_id, summary="任务执行发生内部错误。", payload={"reason": "internal_error"}))

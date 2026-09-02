@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from app.agents.roles import ROLE_POLICY
+from app.agents.multi_workflow import DEFAULT_MULTI_LIMITS, MultiStage, MultiWorkflowState
 from app.core.context import ContextManager
 from app.core.models import AgentEvent, AgentRole, EventType
 from app.core.settings import Settings
@@ -29,16 +30,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 ROLE_TURN_LIMITS = {
     AgentRole.SINGLE: 12,
-    AgentRole.PLANNER: 4,
-    AgentRole.EXPLORER: 6,
-    AgentRole.CODER: 10,
-    AgentRole.REVIEWER: 8,
+    AgentRole.PLANNER: DEFAULT_MULTI_LIMITS.planner_turns,
+    AgentRole.EXPLORER: DEFAULT_MULTI_LIMITS.explorer_turns,
+    AgentRole.CODER: DEFAULT_MULTI_LIMITS.coder_turns,
+    AgentRole.REVIEWER: DEFAULT_MULTI_LIMITS.reviewer_calls,
 }
-MAX_REPAIR_CYCLES = 1
+MAX_REPAIR_CYCLES = DEFAULT_MULTI_LIMITS.repair_cycles
 INSPECTION_TOOLS = {"list_files", "read_file", "search_text"}
 WRITE_TOOLS = {"write_file", "replace_text"}
 REVIEW_BASES = {"USER_REQUIREMENT", "FAILED_VERIFICATION", "REGRESSION"}
-ORCHESTRATOR_PROTOCOL = "manager-checkpoint-v7-phased-run"
+ORCHESTRATOR_PROTOCOL = "manager-checkpoint-v8-bounded-graph"
 
 
 @dataclass(frozen=True)
@@ -69,12 +70,12 @@ def normalize_agent_config(config: dict[str, Any] | None) -> dict[str, dict[str,
             max_turns = int(value.get("max_turns", defaults["max_turns"]))
         except (TypeError, ValueError):
             max_turns = int(defaults["max_turns"])
+        fixed_multi_role = role != AgentRole.SINGLE.value
         normalized[role] = {
-            "enabled": bool(value.get("enabled", defaults["enabled"])),
-            "max_turns": max(1, min(30, max_turns)),
+            "enabled": True if fixed_multi_role else bool(value.get("enabled", defaults["enabled"])),
+            "max_turns": int(defaults["max_turns"]) if fixed_multi_role else max(1, min(30, max_turns)),
             "instruction": instruction,
         }
-    normalized[AgentRole.CODER.value]["enabled"] = True
     normalized[AgentRole.SINGLE.value]["enabled"] = True
     return normalized
 
@@ -198,6 +199,7 @@ class Orchestrator:
         # 由模型根据任务本身决定是否需要工具；角色权限仍由后端白名单约束。
         self.execution_mode = resolve_agent_mode(execution_mode, self.task_analysis)
         self.agent_config = normalize_agent_config(agent_config)
+        self.multi_workflow = MultiWorkflowState() if self.execution_mode == "multi" else None
         self.memory_metadata = memory_metadata or {}
         self.requires_change = self.task_analysis.requires_file_change
         self.requires_command = self.task_analysis.requires_command
@@ -206,39 +208,55 @@ class Orchestrator:
         if self.execution_mode == "single":
             roles = [AgentRole.SINGLE]
         else:
-            roles = [role for role in (AgentRole.PLANNER, AgentRole.EXPLORER, AgentRole.CODER, AgentRole.REVIEWER) if self.agent_config[role.value]["enabled"]]
-            if not self.requires_change and not self.requires_command:
-                # Read-only/reporting work has no implementation node. Explorer owns the user-facing draft;
-                # Reviewer remains an internal gate and never replaces that draft.
-                roles = [role for role in roles if role is not AgentRole.CODER]
+            # The multi-agent graph is structural, not user-configurable. Old persisted
+            # role switches cannot silently remove planning, exploration, or review.
+            roles = [AgentRole.PLANNER, AgentRole.EXPLORER, AgentRole.CODER, AgentRole.REVIEWER]
         has_reviewer = AgentRole.REVIEWER in roles
         implementers = {AgentRole.CODER, AgentRole.SINGLE}
+        role_stages = {
+            AgentRole.PLANNER: MultiStage.PLAN,
+            AgentRole.EXPLORER: MultiStage.EXPLORE,
+            AgentRole.CODER: MultiStage.IMPLEMENT,
+        }
         for role in (item for item in roles if item is not AgentRole.REVIEWER):
             if self.cancelled():
                 raise asyncio.CancelledError
+            if self.multi_workflow is not None:
+                self.multi_workflow.transition(role_stages[role])
             role_finished = await self._run_role(role)
             if not role_finished and role in {AgentRole.PLANNER, AgentRole.EXPLORER}:
                 # 规划和探索只提供上下文，不应因总结超时阻断真正的实现阶段。
                 continue
             if not role_finished and role in implementers and not has_reviewer and not self.criteria:
                 self.failure_reason = f"{role.value}_incomplete"
+                self._fail_multi_workflow()
                 await self.publish(AgentEvent(type=EventType.TASK_FAILED, session_id=self.session_id, role=role, summary="执行达到该角色轮次上限，尚未形成可验收结论。", payload={"reason": self.failure_reason, "changed_files": sorted(self.changed_files)}))
                 return False
-        if has_reviewer and not await self._review_with_repairs():
-            return False
+        if has_reviewer:
+            if self.multi_workflow is not None:
+                self.multi_workflow.transition(MultiStage.REVIEW)
+            if not await self._review_with_repairs():
+                self._fail_multi_workflow()
+                return False
         if not has_reviewer:
-            unmet = self._unmet_criteria()
+            # 单 Agent 走直接完成门槛：真实写入/命令成功即可，不再把模型生成的
+            # 验收项 ID 当成第二套编排协议。细粒度证据账本只服务多 Agent 复核。
+            unmet = [] if self.execution_mode == "single" and self._single_hard_requirements_met() else self._unmet_criteria()
             if unmet:
                 self.failure_reason = "verification_incomplete"
+                self._fail_multi_workflow()
                 await self.publish(AgentEvent(type=EventType.TASK_FAILED, session_id=self.session_id, summary=self._unmet_summary(unmet), payload={"reason": self.failure_reason, "changed_files": sorted(self.changed_files), "execution_mode": self.execution_mode, "unmet_criteria": unmet, "criteria_status": self._criteria_status()}))
                 return False
             final_role = roles[-1]
             self.review_detail = self.role_summaries.get(final_role, "任务已完成。")
             self.completion_source = "structured_evidence" if self.requires_change or self.requires_command else "agent_summary"
         finishing_role = AgentRole.REVIEWER if has_reviewer else roles[-1]
+        if self.multi_workflow is not None:
+            self.multi_workflow.transition(MultiStage.FINALIZE)
         hook_result = await self._run_hooks("before_finish", finishing_role)
         if hook_result is not None and not hook_result.ok:
             self.failure_reason = "before_finish_hook_failed"
+            self._fail_multi_workflow()
             await self.publish(AgentEvent(type=EventType.TASK_FAILED, session_id=self.session_id, summary="结束前 Hook 未通过，改动已保留。", payload={"reason": self.failure_reason, "content": hook_result.content}))
             return False
         user_result = self._user_facing_summary()
@@ -251,13 +269,22 @@ class Orchestrator:
             summary = user_result
         else:
             summary = "执行流程已经结束，但本次没有写入文件；请检查执行说明和工具记录。"
+        if self.multi_workflow is not None:
+            self.multi_workflow.transition(MultiStage.DONE)
         await self.publish(AgentEvent(
             type=EventType.TASK_FINISHED,
             session_id=self.session_id,
             summary=summary,
-            payload={"changed_files": sorted(self.changed_files), "completion_source": self.completion_source, "verification_status": "passed", "execution_mode": self.execution_mode, "intent": "command" if self.requires_command else "change" if self.requires_change else "general", "repair_cycles": self.repair_cycles, "criteria_status": self._criteria_status()},
+            payload={"changed_files": sorted(self.changed_files), "completion_source": self.completion_source, "verification_status": "passed", "execution_mode": self.execution_mode, "intent": "command" if self.requires_command else "change" if self.requires_change else "general", "repair_cycles": self.repair_cycles, "criteria_status": self._criteria_status(), "multi_agent_limits": DEFAULT_MULTI_LIMITS.public_dict() if self.multi_workflow is not None else {}, **self._workflow_payload()},
         ))
         return True
+
+    def _workflow_payload(self) -> dict[str, Any]:
+        return self.multi_workflow.payload() if self.multi_workflow is not None else {}
+
+    def _fail_multi_workflow(self) -> None:
+        if self.multi_workflow is not None:
+            self.multi_workflow.fail()
 
     def _user_facing_summary(self) -> str:
         """Reviewer output is control-plane data; only a working agent may address the user."""
@@ -281,7 +308,7 @@ class Orchestrator:
             session_id=self.session_id,
             role=AgentRole.REVIEWER,
             summary="正在按验收项核对证据账本。",
-            payload={"criteria_status": self._criteria_status(), "structured_review": True},
+            payload={"criteria_status": self._criteria_status(), "structured_review": True, **self._workflow_payload()},
         ))
         try:
             review: TaskReview = await self.client.review_task(
@@ -308,7 +335,7 @@ class Orchestrator:
             session_id=self.session_id,
             role=AgentRole.REVIEWER,
             summary=review.summary or "结构化验收已完成。",
-            payload={"structured_review": True, **review_payload},
+            payload={"structured_review": True, **review_payload, **self._workflow_payload()},
         ))
 
         ledger_unmet = set(self._unmet_criteria())
@@ -321,6 +348,8 @@ class Orchestrator:
 
         if self.repair_cycles < MAX_REPAIR_CYCLES:
             self.repair_cycles += 1
+            if self.multi_workflow is not None:
+                self.multi_workflow.transition(MultiStage.REPAIR)
             repair_start = len(self.evidence_ledger)
             actions = [
                 f"{item.criterion_id}: {item.action or item.evidence or '补齐该验收项的实现和验证证据'}"
@@ -329,9 +358,8 @@ class Orchestrator:
             known = {item.criterion_id for item in review.assessments}
             actions.extend(f"{criterion_id}: 补齐该验收项的工具证据" for criterion_id in sorted(open_ids - known))
             self.open_review_issue = "\n".join(actions)
-            repair_role = AgentRole.CODER if self.requires_change or self.requires_command else AgentRole.EXPLORER
             await self._run_role(
-                repair_role,
+                AgentRole.CODER,
                 phase_instruction=(
                     "这是唯一一次内部返工。只处理下列仍未闭环的验收项，不重新审计其他范围：\n"
                     f"{self.open_review_issue}\n"
@@ -402,6 +430,8 @@ class Orchestrator:
 
             if self.requires_change and self.repair_cycles < MAX_REPAIR_CYCLES:
                 self.repair_cycles += 1
+                if self.multi_workflow is not None:
+                    self.multi_workflow.transition(MultiStage.REPAIR)
                 repair_request = self.review_detail or "重新核对用户要求、文件内容和验证结果，并补齐尚未完成的部分。"
                 self.open_review_issue = repair_request
                 await self._run_role(
@@ -413,6 +443,8 @@ class Orchestrator:
                     ),
                     phase_payload={"repair_cycle": self.repair_cycles, "repairing": True},
                 )
+                if self.multi_workflow is not None:
+                    self.multi_workflow.transition(MultiStage.REVIEW)
                 continue
 
             latest_validation = next((item for item in reversed(self.evidence_details) if item["tool"] == "run_command"), None)
@@ -425,6 +457,7 @@ class Orchestrator:
             else:
                 self.failure_reason = "acceptance_gap_after_repairs"
                 detail = self.review_detail or "仍有一项可追溯的用户验收要求未满足。"
+            self._fail_multi_workflow()
             await self.publish(AgentEvent(
                 type=EventType.TASK_FAILED,
                 session_id=self.session_id,
@@ -435,6 +468,7 @@ class Orchestrator:
                     "content": detail,
                     "changed_files": sorted(self.changed_files),
                     "repair_cycles": self.repair_cycles,
+                    **self._workflow_payload(),
                 },
             ))
             return False
@@ -443,6 +477,13 @@ class Orchestrator:
         criterion = self.criteria.get(criterion_id)
         if criterion is None:
             return False
+        if (
+            self.execution_mode == "single"
+            and criterion.kind == "file_change"
+            and not self.changed_files
+            and self._single_runtime_resolution_completed()
+        ):
+            return True
         records = [
             item for item in self.evidence_ledger
             if criterion_id in item.criterion_ids and item.sequence > after_sequence
@@ -486,6 +527,7 @@ class Orchestrator:
     async def _fail_unmet_criteria(self, criterion_ids: list[str] | set[str], detail: str) -> bool:
         ids = sorted(criterion_ids)
         self.failure_reason = "acceptance_evidence_incomplete"
+        self._fail_multi_workflow()
         await self.publish(AgentEvent(
             type=EventType.TASK_FAILED,
             session_id=self.session_id,
@@ -497,26 +539,35 @@ class Orchestrator:
                 "repair_cycles": self.repair_cycles,
                 "unmet_criteria": ids,
                 "criteria_status": self._criteria_status(),
+                **self._workflow_payload(),
             },
         ))
         return False
 
     def _review_evidence_payload(self) -> dict[str, Any]:
-        return {
-            "criteria_status": self._criteria_status(),
-            "records": [
-                {
-                    "sequence": item.sequence,
-                    "kind": item.kind,
-                    "criterion_ids": list(item.criterion_ids),
-                    "ok": item.ok,
-                    "tool": item.tool,
-                    "write_version": item.write_version,
-                    **item.detail,
-                }
-                for item in self.evidence_ledger[-30:]
-            ],
-        }
+        criteria_status = self._criteria_status()
+        records: list[dict[str, Any]] = []
+        used = len(json.dumps(criteria_status, ensure_ascii=False))
+        for item in reversed(self.evidence_ledger):
+            detail = {
+                key: value[:500] if isinstance(value, str) else value
+                for key, value in item.detail.items()
+            }
+            record = {
+                "sequence": item.sequence,
+                "kind": item.kind,
+                "criterion_ids": list(item.criterion_ids),
+                "ok": item.ok,
+                "tool": item.tool,
+                "write_version": item.write_version,
+                **detail,
+            }
+            size = len(json.dumps(record, ensure_ascii=False))
+            if records and used + size > DEFAULT_MULTI_LIMITS.evidence_chars:
+                break
+            records.insert(0, record)
+            used += size
+        return {"criteria_status": criteria_status, "records": records}
 
     def _has_structured_completion_evidence(self) -> bool:
         """新任务要求写入后验证；续跑任务允许对已保留文件直接验证后完成。"""
@@ -565,11 +616,53 @@ class Orchestrator:
                 f"{index}. run_command role={item['role']} ok={item['ok']} code={item['code']} "
                 f"exit_code={item.get('exit_code', 'unknown')} command={command!r} output_tail={output!r}"
             )
-        return "\n".join(lines)[:6000]
+        limit = DEFAULT_MULTI_LIMITS.evidence_chars if self.multi_workflow is not None else 6000
+        return "\n".join(lines)[:limit]
 
     def _has_successful_command(self) -> bool:
         commands = [item for item in self.evidence_details if item["tool"] == "run_command"]
         return bool(commands) and bool(commands[-1]["ok"])
+
+    def _single_hard_requirements_met(self) -> bool:
+        """单 Agent 只保留用户能理解的硬门槛，不要求模型维护验收证据图。"""
+        if self.requires_change and not (
+            self._has_structured_completion_evidence() or self._single_runtime_resolution_completed()
+        ):
+            return False
+        if self.requires_command and not self._has_successful_command():
+            return False
+        return True
+
+    def _single_runtime_resolution_completed(self) -> bool:
+        """磁盘代码正确但旧进程未重载时，允许“运行时动作→现场验证”闭环。"""
+        commands = [item for item in self.evidence_details if item["tool"] == "run_command" and item["ok"]]
+        action_indexes = [
+            index for index, item in enumerate(commands)
+            if item.get("evidence_kind") == "action"
+        ]
+        if not action_indexes:
+            return False
+        return any(
+            index > action_indexes[-1] and item.get("evidence_kind") in {"verification", "inspection"}
+            for index, item in enumerate(commands)
+        )
+
+    def _single_fallback_summary(self) -> str:
+        """工具已经完成时，即使模型耗尽轮次也返回事实摘要，而不是制造假失败。"""
+        successful_commands = [
+            item for item in self.evidence_details
+            if item["tool"] == "run_command" and item["ok"]
+        ]
+        if successful_commands:
+            latest = successful_commands[-1]
+            material = f"{latest.get('command', '')}\n{latest.get('output', '')}"
+            urls = re.findall(r"https?://[^\s'\"`)]+", material)
+            if urls:
+                return f"命令已成功执行并完成验证。访问地址：{urls[-1]}"
+            return "命令已成功执行并完成验证，真实结果已保留在终端记录中。"
+        if self.changed_files:
+            return f"修改和验证已经完成，共更新 {len(self.changed_files)} 个文件。"
+        return "检查已经完成。"
 
     async def _run_role(self, role: AgentRole, phase_instruction: str = "", phase_payload: dict[str, Any] | None = None) -> bool:
         policy = ROLE_POLICY[role]
@@ -589,7 +682,7 @@ class Orchestrator:
                 for item in self.criteria.values()
             ],
         }
-        await self.publish(AgentEvent(type=EventType.AGENT_STARTED, session_id=self.session_id, role=role, summary=start_summary, payload={"execution_mode": self.execution_mode, "task_analysis": analysis_payload, **self.memory_metadata, **(phase_payload or {})}))
+        await self.publish(AgentEvent(type=EventType.AGENT_STARTED, session_id=self.session_id, role=role, summary=start_summary, payload={"execution_mode": self.execution_mode, "task_analysis": analysis_payload, **self.memory_metadata, **(phase_payload or {}), **self._workflow_payload()}))
         language = "English" if self.locale == "en-US" else "Chinese"
         implementation_contract = ""
         if role in {AgentRole.CODER, AgentRole.SINGLE}:
@@ -605,7 +698,7 @@ class Orchestrator:
                     "call replace_text for a focused edit or write_file for a new/full file, then call run_command for an appropriate verification. "
                     "Never claim an implementation is complete without a successful write tool result. "
                     "write_file replaces the entire target: read an existing file completely, reuse its returned sha256 as expected_sha256, and send its complete updated content; never overwrite a page or source file with a partial function or snippet. "
-                    "You may use at most 5 list/read/search calls before your first write; use the explorer handoff and then implement instead of repeatedly inspecting."
+                    f"You may use at most {DEFAULT_MULTI_LIMITS.coder_inspection_calls if role is AgentRole.CODER else 5} list/read/search calls before your first write; use the explorer handoff and then implement instead of repeatedly inspecting."
                 )
             if self.requires_command:
                 implementation_contract += (
@@ -614,9 +707,20 @@ class Orchestrator:
                 )
             implementation_contract += (
                 " Validation must assert the user-visible behavior or returned content, not merely process existence or an HTTP success status. "
-                "If the response reproduces the reported bad content, the defect remains. Every write and verification must include the exact criterion_ids it proves; "
-                "do not attach an unrelated failure to a criterion that already has a targeted successful verification."
+                "If the response reproduces the reported bad content, the defect remains."
             )
+            if role is AgentRole.SINGLE:
+                implementation_contract += (
+                    " Keep the workflow direct: perform the necessary tools, then answer naturally. criterion_ids are optional bookkeeping; "
+                    "never attach a response criterion to a tool call because response criteria are satisfied only by your final answer. "
+                    "If source/tests are already correct but a live service is stale, do not edit a correct file just to satisfy the plan: "
+                    "restart or reload it with evidence_kind=action, then check the live user-visible result with evidence_kind=verification."
+                )
+            else:
+                implementation_contract += (
+                    " Every write and verification must include the exact criterion_ids it proves; "
+                    "do not attach an unrelated failure to a criterion that already has a targeted successful verification."
+                )
         runtime_contract = (
             f" The backend is running on Windows. When verifying Python code, use the exact interpreter "
             f"{json.dumps(sys.executable)} instead of guessing python, python3, or py. "
@@ -640,6 +744,8 @@ class Orchestrator:
         identity_contract = " Never expose or introduce yourself as planner, explorer, coder, reviewer, single agent, or internal agent. Speak to the user as one unified assistant. Treat explicit user naming and preference memory as binding unless it conflicts with the current request or safety rules. When preference memory conflicts with older conversation turns, its newest/current value wins. Never invent a lack of permissions or tools: use the tools actually provided to this role, and report the exact tool result when an action is denied or fails."
         system = {"role": "system", "content": f"{identity} {policy['goal']} Only call permitted tools.{implementation_contract}{runtime_contract}{review_contract}{custom_contract}{identity_contract} Your final answer must be natural, direct, under 180 Chinese characters or 120 English words, and must not repeat earlier agents' plans. Reply in {language}."}
         handoff_text = "\n".join(self.handoffs[-3:]) or "No prior agent handoff."
+        if self.multi_workflow is not None:
+            handoff_text = handoff_text[-DEFAULT_MULTI_LIMITS.handoff_chars:]
         rules_text = self.project_rules or "No project-specific rules were found."
         repairing = bool((phase_payload or {}).get("repairing"))
         evidence_text = f"\n\n{self._evidence_digest()}" if role is AgentRole.REVIEWER or (role is AgentRole.CODER and repairing) else ""
@@ -660,12 +766,17 @@ class Orchestrator:
         criteria_reminded = False
         phase_transition_announced = False
         successful_tools: list[str] = []
+        total_tool_calls = 0
         coder_inspection_calls = 0
         role_writes_at_start = sum(1 for name, ok in self.execution_evidence if name in WRITE_TOOLS and ok)
-        inspection_limit = 3 if repairing else 5
-        role_turn_limit = min(self.settings.max_turns, self.agent_config[role.value]["max_turns"])
-        if role is AgentRole.REVIEWER:
-            role_turn_limit = min(role_turn_limit, 2)
+        if self.multi_workflow is not None:
+            inspection_limit = DEFAULT_MULTI_LIMITS.repair_inspection_calls if repairing else DEFAULT_MULTI_LIMITS.coder_inspection_calls
+            role_turn_limit = DEFAULT_MULTI_LIMITS.role_turns(role, repairing=repairing)
+            role_tool_limit: int | None = DEFAULT_MULTI_LIMITS.role_tool_calls(role, repairing=repairing)
+        else:
+            inspection_limit = 3 if repairing else 5
+            role_turn_limit = min(self.settings.max_turns, self.agent_config[role.value]["max_turns"])
+            role_tool_limit = None
         for _ in range(role_turn_limit):
             if self.cancelled():
                 raise asyncio.CancelledError
@@ -681,19 +792,51 @@ class Orchestrator:
                     restricted = json.loads(json.dumps(schema))
                     if tool_name == "run_command":
                         function = restricted["function"]
-                        function["description"] = "探查阶段已结束。只运行实现验证或用户要求的真实动作；必须携带 criterion_ids，禁止再读取/搜索文件。"
+                        function["description"] = "探查阶段已结束。只运行实现验证或用户要求的真实动作，禁止再读取/搜索文件。"
                         parameters = function["parameters"]
                         parameters["properties"]["evidence_kind"]["enum"] = ["verification", "action"]
-                        parameters["required"] = list(dict.fromkeys([*parameters.get("required", []), "criterion_ids", "evidence_kind"]))
+                        if role is not AgentRole.SINGLE:
+                            parameters["required"] = list(dict.fromkeys([*parameters.get("required", []), "criterion_ids", "evidence_kind"]))
                     active_tools.append(restricted)
+            if role_tool_limit is not None and total_tool_calls >= role_tool_limit:
+                active_tools = []
             try:
                 assistant = await self.client.complete(self.context_manager.trim_role_messages(messages), active_tools)
             except LLMError as error:
-                await self.publish(AgentEvent(type=EventType.TASK_FAILED, session_id=self.session_id, role=role, summary=str(error)))
+                await self.publish(AgentEvent(
+                    type=EventType.TASK_FAILED,
+                    session_id=self.session_id,
+                    role=role,
+                    summary=error.user_message(self.locale),
+                    payload={"reason": error.code, "status_code": error.status_code, "retryable": error.retryable, "stage": "agent_run"},
+                ))
                 raise
-            tool_calls = assistant.get("tool_calls") or []
-            messages.append(assistant)
+            raw_tool_calls = assistant.get("tool_calls") or []
+            dropped_tool_calls = 0
+            tool_calls = raw_tool_calls
+            if role_tool_limit is not None:
+                remaining_tool_calls = max(0, role_tool_limit - total_tool_calls)
+                tool_calls = raw_tool_calls[:remaining_tool_calls]
+                dropped_tool_calls = len(raw_tool_calls) - len(tool_calls)
+            messages.append({**assistant, "tool_calls": tool_calls} if dropped_tool_calls else assistant)
+            if dropped_tool_calls:
+                budget_payload = {
+                    "ok": False,
+                    "code": "role_tool_budget_exhausted",
+                    "content": "Extra tool calls were discarded before execution.",
+                    "meta": {"limit": role_tool_limit, "dropped_calls": dropped_tool_calls},
+                }
+                await self.publish(AgentEvent(
+                    type=EventType.TOOL_FINISHED,
+                    session_id=self.session_id,
+                    role=role,
+                    summary=f"已截断 {dropped_tool_calls} 个超出固定预算的工具调用。",
+                    payload={"tool": "workflow_budget", "arguments": {}, "result": budget_payload, "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()},
+                ))
             if not tool_calls:
+                if dropped_tool_calls:
+                    messages.append({"role": "user", "content": "The fixed tool-call budget is exhausted. Do not request more tools; return a concise handoff based on the retained results."})
+                    continue
                 summary = (assistant.get("content") or "角色未给出文字总结").strip()[:800]
                 if contains_serialized_tool_call(summary):
                     messages.append({
@@ -713,7 +856,18 @@ class Orchestrator:
                     execution_reminded = True
                     messages.append({"role": "user", "content": "The user requested an actual command action, but no command has executed successfully. Call run_command now and base the final answer on its real result. Do not merely promise to run it."})
                     continue
-                unmet = self._unmet_criteria()
+                if role is AgentRole.SINGLE and self.requires_change and not (
+                    self._has_structured_completion_evidence() or self._single_runtime_resolution_completed()
+                ) and not criteria_reminded:
+                    criteria_reminded = True
+                    messages.append({
+                        "role": "user",
+                        "content": "The file change is present, but it still needs one successful final verification. Run the relevant test or check once, then answer the user directly.",
+                    })
+                    continue
+                # 当前自然语言内容本身就是 response 验收项的证据。单 Agent 不应
+                # 因为“回复还没有被记录”而被要求再调用一个毫不相关的工具。
+                unmet = [] if role is AgentRole.SINGLE else self._unmet_criteria()
                 if role in {AgentRole.CODER, AgentRole.SINGLE} and unmet and not criteria_reminded:
                     criteria_reminded = True
                     descriptions = "; ".join(f"{item}: {self.criteria[item].description}" for item in unmet)
@@ -728,16 +882,15 @@ class Orchestrator:
                     continue
                 self.handoffs.append(f"{role.value}: {summary}")
                 self.role_summaries[role] = summary
-                if role in {AgentRole.CODER, AgentRole.SINGLE} or (
-                    role is AgentRole.EXPLORER and not self.requires_change and not self.requires_command
-                ):
+                if role in {AgentRole.CODER, AgentRole.SINGLE}:
                     self._record_response_evidence(role, summary)
-                await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary}))
+                await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()}))
                 return True
             for call in tool_calls:
                 if self.cancelled():
                     raise asyncio.CancelledError
                 name = call.get("function", {}).get("name", "")
+                arguments: dict[str, Any] = {}
                 try:
                     arguments = json.loads(call.get("function", {}).get("arguments", "{}"))
                 except json.JSONDecodeError:
@@ -760,7 +913,12 @@ class Orchestrator:
                     if role in {AgentRole.CODER, AgentRole.SINGLE} and inspection_call:
                         # 重复调用同样消耗探查预算，否则 repeated_tool_call 会让角色无限保留读取工具。
                         coder_inspection_calls += 1
-                    if repeated_calls[signature] > 2:
+                    tool_budget_exhausted = role_tool_limit is not None and total_tool_calls >= role_tool_limit
+                    if not tool_budget_exhausted:
+                        total_tool_calls += 1
+                    if tool_budget_exhausted:
+                        result = ToolResult(False, "role_tool_budget_exhausted", "The fixed tool-call budget for this role is exhausted. Return a concise handoff now.", {"limit": role_tool_limit})
+                    elif repeated_calls[signature] > 2:
                         result = ToolResult(False, "repeated_tool_call", "", {"tool": name})
                     elif inspection_budget_exhausted:
                         result = ToolResult(False, "inspection_budget_exhausted", "Use the collected context now: call replace_text/write_file for a concrete fix or run_command to verify retained files.", {"limit": inspection_limit})
@@ -770,8 +928,10 @@ class Orchestrator:
                 payload = {"ok": result.ok, "code": result.code, "content": result.content, "meta": result.meta}
                 if result.ok:
                     successful_tools.append(name)
-                await self.publish(AgentEvent(type=EventType.TOOL_FINISHED, session_id=self.session_id, role=role, summary=f"工具完成：{name}（{result.code}）", payload={"tool": name, "arguments": arguments, "result": payload}))
+                await self.publish(AgentEvent(type=EventType.TOOL_FINISHED, session_id=self.session_id, role=role, summary=f"工具完成：{name}（{result.code}）", payload={"tool": name, "arguments": arguments, "result": payload, "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()}))
                 messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": json.dumps(payload, ensure_ascii=False)})
+            if dropped_tool_calls:
+                messages.append({"role": "user", "content": "Additional tool calls were discarded because this role reached its hard budget. Summarize the retained results now; do not request more tools."})
             if (
                 role in {AgentRole.CODER, AgentRole.SINGLE}
                 and coder_inspection_calls >= inspection_limit
@@ -788,6 +948,23 @@ class Orchestrator:
                         "Do not issue another inspection command."
                     ),
                 })
+        if role is AgentRole.SINGLE and self._single_hard_requirements_met():
+            try:
+                forced = await self.client.complete(
+                    self.context_manager.trim_role_messages(messages + [{
+                        "role": "user",
+                        "content": "Stop using tools. The required action has succeeded. Give the user one direct natural-language result based only on the actual tool output, including any final URL or command result.",
+                    }]),
+                    [],
+                )
+            except LLMError:
+                forced = {}
+            summary = str(forced.get("content") or "").strip()[:800] or self._single_fallback_summary()
+            self.handoffs.append(f"{role.value}: {summary}")
+            self.role_summaries[role] = summary
+            self._record_response_evidence(role, summary)
+            await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "reason": "forced_summary", "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()}))
+            return True
         if role is AgentRole.REVIEWER:
             try:
                 forced = await self.client.complete(
@@ -798,7 +975,7 @@ class Orchestrator:
                     summary = str(forced["content"]).strip()[:800]
                     self.handoffs.append(f"{role.value}: {summary}")
                     self.role_summaries[role] = summary
-                    await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "reason": "forced_summary"}))
+                    await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "reason": "forced_summary", "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()}))
                     return True
             except LLMError:
                 pass
@@ -808,7 +985,7 @@ class Orchestrator:
             summary = "本角色已完成工具操作，但在整理总结前达到轮次上限；结果已保留在工具记录中。" if successful_tools else "本角色在给出最终总结前达到轮次上限，请检查工具记录。"
         self.handoffs.append(f"{role.value}: {summary}")
         self.role_summaries[role] = summary
-        await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "reason": "turn_limit"}))
+        await self.publish(AgentEvent(type=EventType.AGENT_FINISHED, session_id=self.session_id, role=role, summary=summary, payload={"content": summary, "reason": "turn_limit", "role_tool_calls": total_tool_calls, "role_tool_call_limit": role_tool_limit, **self._workflow_payload()}))
         return False
 
     async def _execute(self, role: AgentRole, name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -817,7 +994,14 @@ class Orchestrator:
             return ToolResult(False, "tool_not_permitted", "", {})
         criterion_ids, evidence_kind, binding_error = self._resolve_evidence_binding(name, arguments)
         if binding_error:
-            return ToolResult(False, binding_error, "Bind this tool call to the relevant typed acceptance criterion_ids.", {"criterion_ids": list(criterion_ids)})
+            if role is AgentRole.SINGLE:
+                # 单 Agent 的 criterion_ids 只是可选元数据。模型标错 ID 不应阻止
+                # 一条本来合法、安全的文件或命令工具实际执行。
+                requested_kind = str(arguments.get("evidence_kind") or "").strip()
+                criterion_ids = ()
+                evidence_kind = requested_kind if requested_kind in {"verification", "action", "inspection"} else ""
+            else:
+                return ToolResult(False, binding_error, "Bind this tool call to the relevant typed acceptance criterion_ids.", {"criterion_ids": list(criterion_ids)})
         runtime_arguments = dict(arguments)
         runtime_arguments.pop("criterion_ids", None)
         runtime_arguments.pop("evidence_kind", None)
@@ -846,12 +1030,15 @@ class Orchestrator:
                 return ToolResult(False, "not_a_directory", "Use cwd `.` or a listed workspace directory.", {"cwd": cwd})
             if self.command_mode == "deny":
                 return ToolResult(False, "command_permission_denied", "", {"command": arguments.get("command", "")})
-            if self.command_mode == "ask":
+            requires_approval = self.tools.command_requires_approval(command)
+            if self.command_mode == "ask" or requires_approval:
                 if self.request_command_approval is None:
                     return ToolResult(False, "command_approval_unavailable", "", {})
                 allowed = await self.request_command_approval(role, command, cwd)
                 if not allowed:
                     return ToolResult(False, "command_permission_denied", "", {"command": arguments.get("command", "")})
+                if requires_approval:
+                    runtime_arguments["approved"] = True
         try:
             result = await asyncio.to_thread(self.tools.call_mcp, role, name, runtime_arguments) if is_mcp else await asyncio.to_thread(getattr(self.tools, name), **runtime_arguments)
             if name in WRITE_TOOLS or name == "run_command" or (name in INSPECTION_TOOLS and criterion_ids):

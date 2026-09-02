@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from app.agents.orchestrator import Orchestrator, continuation_lineage_has_successful_write, is_file_mutation_command, is_inspection_command, normalize_agent_config, parse_reviewer_basis, parse_reviewer_verdict, resolve_agent_mode, turn_has_successful_write
+from app.agents.multi_workflow import DEFAULT_MULTI_LIMITS, MultiStage, MultiWorkflowState
 from app.core.settings import settings
 from app.core.models import AgentEvent, AgentRole, EventType
 from app.core.auth import LocalAuth
@@ -28,6 +29,29 @@ class FakeClient:
         if "reviewer agent" in messages[0]["content"]:
             return {"role": "assistant", "content": "VERDICT: PASS 已检查完成"}
         return {"role": "assistant", "content": "已完成"}
+
+
+class BurstToolClient(FakeClient):
+    def __init__(self):
+        self.explorer_called = False
+
+    async def complete(self, messages, tools):
+        system = messages[0]["content"]
+        if "explorer agent" in system and not self.explorer_called:
+            self.explorer_called = True
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"burst-{index}",
+                        "type": "function",
+                        "function": {"name": "list_files", "arguments": '{"path":"."}'},
+                    }
+                    for index in range(6)
+                ],
+            }
+        return await super().complete(messages, tools)
 
 
 class RepeatingToolClient:
@@ -392,9 +416,17 @@ class ContinuationReplayClient:
 
 
 class InternalReviewSummaryClient:
+    def __init__(self):
+        self.inspected = False
+
     async def complete(self, messages, tools):
         system = messages[0]["content"]
         if "explorer agent" in system:
+            if not self.inspected:
+                self.inspected = True
+                return {"role": "assistant", "content": None, "tool_calls": [{"id": "inspect", "type": "function", "function": {"name": "list_files", "arguments": '{"path":".","criterion_ids":["AC1"]}'}}]}
+            return {"role": "assistant", "content": "当前目录包含 `main.py`、`static/` 和 `tests/`，是一个 FastAPI 任务管理项目。"}
+        if "coder agent" in system:
             return {"role": "assistant", "content": "当前目录包含 `main.py`、`static/` 和 `tests/`，是一个 FastAPI 任务管理项目。"}
         return {"role": "assistant", "content": "已整理请求。"}
 
@@ -402,6 +434,63 @@ class InternalReviewSummaryClient:
         return TaskReview(tuple(
             CriterionReview(item.id, "satisfied", "internal evidence") for item in analysis.criteria
         ), "Both acceptance criteria are satisfied. AC1 and AC2 are complete.")
+
+
+class SingleNaturalSummaryClient:
+    def __init__(self):
+        self.inspected = False
+
+    async def complete(self, messages, tools):
+        if not self.inspected:
+            self.inspected = True
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "inspect", "type": "function", "function": {"name": "list_files", "arguments": '{"path":".","criterion_ids":["AC1"]}'}}]}
+        return {"role": "assistant", "content": "当前工作目录包含 `main.py`、`static/`、`tests/`，项目状态正常。"}
+
+
+class SimpleSingleCommandClient:
+    def __init__(self):
+        self.stage = 0
+
+    async def complete(self, messages, tools):
+        if self.stage == 0:
+            self.stage += 1
+            # 故意把命令绑定到 response 验收项，复现真实会话中的模型标注错误。
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "start-and-check",
+                    "type": "function",
+                    "function": {
+                        "name": "run_command",
+                        "arguments": json.dumps({
+                            "command": "echo HTTP 200 http://127.0.0.1:8765/",
+                            "criterion_ids": ["AC3"],
+                            "evidence_kind": "verification",
+                        }),
+                    },
+                }],
+            }
+        return {"role": "assistant", "content": "服务已成功启动，访问地址：http://127.0.0.1:8765/"}
+
+
+class RuntimeRefreshSingleClient:
+    def __init__(self):
+        self.stage = 0
+
+    async def complete(self, messages, tools):
+        calls = [
+            {"command": "echo runtime-restarted", "criterion_ids": ["AC1"], "evidence_kind": "action"},
+            {"command": "echo live-response-ok", "criterion_ids": ["AC1"], "evidence_kind": "verification"},
+        ]
+        if self.stage < len(calls):
+            arguments = calls[self.stage]
+            self.stage += 1
+            return {"role": "assistant", "content": None, "tool_calls": [{
+                "id": f"runtime-{self.stage}", "type": "function",
+                "function": {"name": "run_command", "arguments": json.dumps(arguments)},
+            }]}
+        return {"role": "assistant", "content": "旧服务已重载，现场接口验证正常。"}
 
 
 class CoreTests(unittest.TestCase):
@@ -538,7 +627,31 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("acceptance criteria", final.summary)
             self.assertNotIn("AC1", final.summary)
             started = [event.role for event in events if event.type == EventType.AGENT_STARTED]
-            self.assertNotIn(AgentRole.CODER, started)
+            self.assertIn(AgentRole.CODER, started)
+
+    def test_single_agent_workspace_summary_is_direct_natural_language_without_reviewer(self):
+        analysis = TaskAnalysis(adaptive_mode="single", criteria=(
+            AcceptanceCriterion("AC1", "检查工作目录", "inspection"),
+            AcceptanceCriterion("AC2", "直接向用户总结", "response"),
+        ))
+
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "single-summary", "总结当前工作目录并直接输出", ToolRegistry(Workspace(directory)),
+                SingleNaturalSummaryClient(), settings, publish, execution_mode="adaptive", task_analysis=analysis,
+            )
+            return await runner.run(), events
+
+        with TemporaryDirectory() as directory:
+            completed, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            started = [event.role for event in events if event.type == EventType.AGENT_STARTED]
+            self.assertEqual(started, [AgentRole.SINGLE])
+            self.assertIn("当前工作目录包含", events[-1].summary)
+            self.assertNotIn("AC1", events[-1].summary)
+            self.assertNotIn("acceptance criteria", events[-1].summary)
 
     def test_project_rules_are_sorted_limited_and_hooks_default_off(self):
         with TemporaryDirectory() as directory:
@@ -700,6 +813,23 @@ class CoreTests(unittest.TestCase):
             allowed, denied, approvals = asyncio.run(exercise(directory))
             self.assertTrue(allowed.ok)
             self.assertEqual(denied.code, "command_permission_denied")
+            self.assertEqual(len(approvals), 1)
+
+    def test_risky_command_requests_approval_even_in_auto_mode(self):
+        async def exercise(directory):
+            approvals = []
+            async def approve(role, command, cwd):
+                approvals.append((role, command, cwd))
+                return True
+            runner = Orchestrator(
+                "test", "执行需要确认的命令", ToolRegistry(Workspace(directory)), FakeClient(), settings,
+                lambda event: asyncio.sleep(0), command_mode="auto", request_command_approval=approve,
+            )
+            result = await runner._execute(AgentRole.SINGLE, "run_command", {"command": "echo taskkill simulation"})
+            return result, approvals
+        with TemporaryDirectory() as directory:
+            result, approvals = asyncio.run(exercise(directory))
+            self.assertTrue(result.ok)
             self.assertEqual(len(approvals), 1)
 
     def test_windows_tail_pipeline_is_rejected_before_requesting_approval(self):
@@ -949,19 +1079,21 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(events[-1].type, "task_finished")
 
     def test_orchestrator_runs_all_roles(self):
-        async def exercise():
+        async def exercise(directory):
             events = []
 
             async def publish(event):
                 events.append(event)
 
-            tools = ToolRegistry(Workspace(r"C:\Desktop\NJUSE_AgentProj"))
-            await Orchestrator("test", "检查项目", tools, FakeClient(), settings, publish).run()
+            tools = ToolRegistry(Workspace(directory))
+            await Orchestrator("test", "创建并验证文件", tools, StructuredEvidenceClient(), settings, publish, task_analysis=CHANGE_ANALYSIS).run()
             return events
 
-        events = asyncio.run(exercise())
-        self.assertEqual(len(events), 9)
-        self.assertEqual(events[-1].type, "task_finished")
+        with TemporaryDirectory() as directory:
+            events = asyncio.run(exercise(directory))
+            started = [event.role for event in events if event.type == EventType.AGENT_STARTED]
+            self.assertEqual(started, [AgentRole.PLANNER, AgentRole.EXPLORER, AgentRole.CODER, AgentRole.REVIEWER])
+            self.assertEqual(events[-1].type, "task_finished")
 
     def test_repeated_tool_calls_do_not_fail_entire_task(self):
         async def exercise():
@@ -986,15 +1118,17 @@ class CoreTests(unittest.TestCase):
             async def publish(_event):
                 return None
 
-            await Orchestrator("test", "检查项目", ToolRegistry(Workspace(directory)), client, settings, publish).run()
+            await Orchestrator("test", "检查并修改项目", ToolRegistry(Workspace(directory)), client, settings, publish, task_analysis=CHANGE_ANALYSIS).run()
             return client.system_messages
 
         with TemporaryDirectory() as directory:
             system_messages = asyncio.run(exercise(directory))
-            self.assertNotIn("exact interpreter", system_messages[0])
-            self.assertNotIn("exact interpreter", system_messages[1])
-            self.assertIn("exact interpreter", system_messages[2])
-            self.assertIn("exact interpreter", system_messages[3])
+            non_command = [item for item in system_messages if "planner agent" in item or "explorer agent" in item]
+            command_roles = [item for item in system_messages if "coder agent" in item or "reviewer agent" in item]
+            self.assertTrue(non_command)
+            self.assertTrue(command_roles)
+            self.assertTrue(all("exact interpreter" not in item for item in non_command))
+            self.assertTrue(all("exact interpreter" in item for item in command_roles))
 
     def test_successful_write_is_reported_in_completion_event(self):
         async def exercise(directory):
@@ -1029,20 +1163,27 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(any(event.type == "task_finished" for event in events))
 
     def test_read_only_task_with_modify_negation_does_not_require_write(self):
+        analysis = TaskAnalysis(adaptive_mode="single", criteria=(
+            AcceptanceCriterion("AC1", "只读检查目录", "inspection"),
+            AcceptanceCriterion("AC2", "输出检查总结", "response"),
+        ))
         async def exercise(directory):
             events = []
 
             async def publish(event):
                 events.append(event)
 
-            completed = await Orchestrator("test", "只读检查，不要修改文件", ToolRegistry(Workspace(directory)), NeverWritesClient(), settings, publish).run()
+            completed = await Orchestrator(
+                "test", "只读检查，不要修改文件", ToolRegistry(Workspace(directory)),
+                SingleNaturalSummaryClient(), settings, publish, execution_mode="adaptive", task_analysis=analysis,
+            ).run()
             return completed, events
 
         with TemporaryDirectory() as directory:
             completed, events = asyncio.run(exercise(directory))
             self.assertTrue(completed)
             self.assertEqual(events[-1].type, "task_finished")
-            self.assertIn("只读检查完成", events[-1].summary)
+            self.assertIn("当前工作目录包含", events[-1].summary)
 
     def test_reviewer_rejection_prevents_false_completion(self):
         async def exercise(directory):
@@ -1075,14 +1216,120 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(started_roles, [AgentRole.SINGLE])
             self.assertEqual(events[-1].payload["execution_mode"], "single")
 
-    def test_multi_agent_roles_can_be_disabled_but_coder_is_forced_on(self):
+    def test_single_agent_does_not_fail_a_successful_command_over_evidence_metadata(self):
+        analysis = TaskAnalysis(adaptive_mode="single", criteria=(
+            AcceptanceCriterion("AC1", "启动服务", "command"),
+            AcceptanceCriterion("AC2", "检查服务响应", "inspection"),
+            AcceptanceCriterion("AC3", "向用户返回访问地址", "response"),
+        ))
+
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "single-command", "启动服务并告诉我地址", ToolRegistry(Workspace(directory)),
+                SimpleSingleCommandClient(), settings, publish, execution_mode="single", task_analysis=analysis,
+            )
+            return await runner.run(), events
+
+        with TemporaryDirectory() as directory:
+            completed, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual(events[-1].type, EventType.TASK_FINISHED)
+            self.assertIn("http://127.0.0.1:8765/", events[-1].summary)
+            tool_results = [event.payload["result"]["code"] for event in events if event.type == EventType.TOOL_FINISHED]
+            self.assertEqual(tool_results, ["ok"])
+            self.assertFalse(any(event.type == EventType.TASK_FAILED for event in events))
+
+    def test_multi_agent_still_rejects_mismatched_evidence_metadata(self):
+        analysis = TaskAnalysis(adaptive_mode="multi", criteria=(
+            AcceptanceCriterion("AC1", "启动服务", "command"),
+            AcceptanceCriterion("AC2", "向用户返回访问地址", "response"),
+        ))
+
+        async def exercise(directory):
+            runner = Orchestrator(
+                "multi-binding", "启动服务", ToolRegistry(Workspace(directory)), FakeClient(),
+                settings, lambda event: asyncio.sleep(0), execution_mode="multi", task_analysis=analysis,
+            )
+            return await runner._execute(AgentRole.CODER, "run_command", {
+                "command": "echo should-not-run",
+                "criterion_ids": ["AC2"],
+                "evidence_kind": "action",
+            })
+
+        with TemporaryDirectory() as directory:
+            result = asyncio.run(exercise(directory))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "criterion_kind_mismatch")
+
+    def test_single_agent_can_finish_a_stale_runtime_fix_without_fake_file_edits(self):
+        analysis = TaskAnalysis(requires_file_change=True, adaptive_mode="single", criteria=(
+            AcceptanceCriterion("AC1", "修复运行中的旧服务", "file_change"),
+        ))
+
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "runtime-refresh", "修复页面运行时报错", ToolRegistry(Workspace(directory)),
+                RuntimeRefreshSingleClient(), settings, publish, execution_mode="single", task_analysis=analysis,
+            )
+            return await runner.run(), runner, events
+
+        with TemporaryDirectory() as directory:
+            completed, runner, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            self.assertEqual(runner.changed_files, set())
+            self.assertTrue(runner._single_runtime_resolution_completed())
+            self.assertEqual(events[-1].type, EventType.TASK_FINISHED)
+            self.assertTrue(events[-1].payload["criteria_status"][0]["satisfied"])
+
+    def test_multi_agent_graph_ignores_legacy_role_switches_and_turn_overrides(self):
         config = normalize_agent_config({
             "planner": {"enabled": False}, "explorer": {"enabled": False},
             "coder": {"enabled": False, "max_turns": 30, "instruction": "优先运行测试"},
             "reviewer": {"enabled": False},
         })
-        self.assertTrue(config["coder"]["enabled"])
+        self.assertTrue(all(config[role]["enabled"] for role in ("planner", "explorer", "coder", "reviewer")))
+        self.assertEqual(config["planner"]["max_turns"], DEFAULT_MULTI_LIMITS.planner_turns)
+        self.assertEqual(config["explorer"]["max_turns"], DEFAULT_MULTI_LIMITS.explorer_turns)
+        self.assertEqual(config["coder"]["max_turns"], DEFAULT_MULTI_LIMITS.coder_turns)
+        self.assertEqual(config["reviewer"]["max_turns"], DEFAULT_MULTI_LIMITS.reviewer_calls)
         self.assertEqual(config["coder"]["instruction"], "优先运行测试")
+
+    def test_multi_workflow_rejects_invalid_transitions_and_tracks_steps(self):
+        workflow = MultiWorkflowState()
+        with self.assertRaisesRegex(RuntimeError, "init->implement"):
+            workflow.transition(MultiStage.IMPLEMENT)
+        for stage in (MultiStage.PLAN, MultiStage.EXPLORE, MultiStage.IMPLEMENT, MultiStage.REVIEW, MultiStage.FINALIZE, MultiStage.DONE):
+            workflow.transition(stage)
+        self.assertEqual(workflow.stage, MultiStage.DONE)
+        self.assertEqual(workflow.step, 5)
+
+    def test_multi_agent_caps_all_tool_calls_in_one_model_response(self):
+        async def exercise(directory):
+            events = []
+            async def publish(event): events.append(event)
+            runner = Orchestrator(
+                "bounded-tools", "只读检查项目", ToolRegistry(Workspace(directory)),
+                BurstToolClient(), settings, publish,
+                agent_config={role: {"enabled": False, "max_turns": 30} for role in ("planner", "explorer", "coder", "reviewer")},
+            )
+            return await runner.run(), events
+
+        with TemporaryDirectory() as directory:
+            completed, events = asyncio.run(exercise(directory))
+            self.assertTrue(completed)
+            started = [event.role for event in events if event.type == EventType.AGENT_STARTED]
+            self.assertEqual(started, [AgentRole.PLANNER, AgentRole.EXPLORER, AgentRole.CODER, AgentRole.REVIEWER])
+            explorer_tools = [event for event in events if event.type == EventType.TOOL_FINISHED and event.role == AgentRole.EXPLORER]
+            self.assertEqual(len(explorer_tools), 5)
+            budget_event = next(event for event in explorer_tools if event.payload["result"]["code"] == "role_tool_budget_exhausted")
+            self.assertEqual(budget_event.payload["result"]["meta"]["dropped_calls"], 2)
+            self.assertEqual(sum(event.payload["tool"] == "list_files" for event in explorer_tools), 4)
+            self.assertEqual(events[-1].payload["workflow_state"], "done")
+            self.assertEqual(events[-1].payload["multi_agent_limits"]["explorer_tool_calls"], 4)
 
     def test_adaptive_mode_uses_the_api_analysis_choice(self):
         self.assertEqual(resolve_agent_mode("adaptive", TaskAnalysis(adaptive_mode="single")), "single")

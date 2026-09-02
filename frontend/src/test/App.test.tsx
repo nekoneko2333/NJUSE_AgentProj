@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import App, { normalizeMarkdownLinks, selectDisplayEvents } from '../App'
+import App, { getTurnQueueState, normalizeMarkdownLinks, selectDisplayEvents } from '../App'
 
 const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 
@@ -73,7 +73,8 @@ describe('App conversation stability', () => {
     expect(document.querySelector('.conversation')).toBeInTheDocument()
     expect(screen.getAllByText('跨对话项目记忆')).toHaveLength(1)
     await userEvent.click(screen.getByRole('button', { name:/Agent 编排与对比/ }))
-    expect(screen.getByRole('button', { name:/四 Agent.*分工协作/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name:/四 Agent.*固定有界流程/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getAllByText(/· 最大轮次/)).toHaveLength(4)
     expect(screen.queryByRole('switch', { name:'启用或关闭角色' })).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name:/单 Agent.*对照基线/ }))
     expect(screen.getByRole('button', { name:/单 Agent.*对照基线/ })).toHaveAttribute('aria-pressed', 'true')
@@ -110,5 +111,15 @@ describe('App conversation stability', () => {
       event('agent_started', 'retry implementation', 'coder'),
     ])
     expect(visible.map(({ event: item }) => item.summary)).toEqual(['', 'retry implementation'])
+  })
+
+  it('tracks the active queued turn separately from a completed previous answer', () => {
+    const events = [
+      { type:'task_created' as const, session_id:'session-1', turn_id:'turn-5', summary:'', payload:{ task:'继续', position:5 } },
+      { type:'task_finished' as const, session_id:'session-1', turn_id:'turn-5', summary:'上一轮回答', payload:{} },
+      { type:'task_created' as const, session_id:'session-1', turn_id:'turn-6', summary:'', payload:{ task:'修复前端', position:6 } },
+      { type:'task_created' as const, session_id:'session-1', turn_id:'turn-7', summary:'', payload:{ task:'再补一个要求', position:7 } },
+    ]
+    expect(getTurnQueueState(events, 'turn-6')).toEqual({ activeTurnPosition:6, queuedCount:1 })
   })
 })

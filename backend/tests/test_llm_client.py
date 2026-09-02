@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
+import httpx
 
-from app.llm.client import AcceptanceCriterion, OpenAICompatibleClient, TaskAnalysis, TaskReview
+from app.llm.client import AcceptanceCriterion, LLMError, OpenAICompatibleClient, TaskAnalysis, TaskReview
 
 
 class FakeResponse:
@@ -42,6 +43,17 @@ class AnalysisResponse(FakeResponse):
 class AnalysisAsyncClient(FakeAsyncClient):
     async def post(self, *_args, **_kwargs):
         return AnalysisResponse()
+
+
+class StatusAsyncClient(FakeAsyncClient):
+    status_code = 402
+    calls = 0
+
+    async def post(self, *_args, **_kwargs):
+        type(self).calls += 1
+        request = httpx.Request("POST", "https://example.test/chat/completions")
+        response = httpx.Response(self.status_code, request=request)
+        raise httpx.HTTPStatusError("status error", request=request, response=response)
 
 
 class LLMClientTests(unittest.IsolatedAsyncioTestCase):
@@ -92,3 +104,27 @@ class LLMClientTests(unittest.IsolatedAsyncioTestCase):
         allowed = {"AC1", "AC2"}
         with self.assertRaises(ValueError):
             TaskReview.from_payload({"assessments": [{"criterion_id": "AC1", "status": "satisfied"}]}, allowed)
+
+    async def test_payment_required_is_not_retried_or_hidden_as_generic_failure(self):
+        StatusAsyncClient.status_code = 402
+        StatusAsyncClient.calls = 0
+        client = OpenAICompatibleClient(api_key="configured", base_url="https://example.test", model="demo")
+        with patch("app.llm.client.httpx.AsyncClient", StatusAsyncClient):
+            with self.assertRaises(LLMError) as raised:
+                await client.analyze_task(task="启动服务", conversation_context="", requested_mode="single")
+        self.assertEqual(raised.exception.code, "llm_quota_exhausted")
+        self.assertEqual(raised.exception.status_code, 402)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(StatusAsyncClient.calls, 1)
+        self.assertIn("HTTP 402", raised.exception.user_message())
+
+    async def test_rate_limit_is_retried_three_times_before_clear_failure(self):
+        StatusAsyncClient.status_code = 429
+        StatusAsyncClient.calls = 0
+        client = OpenAICompatibleClient(api_key="configured", base_url="https://example.test", model="demo")
+        with patch("app.llm.client.httpx.AsyncClient", StatusAsyncClient), patch("app.llm.client.asyncio.sleep", return_value=None):
+            with self.assertRaises(LLMError) as raised:
+                await client.complete([{"role": "user", "content": "test"}], [])
+        self.assertEqual(raised.exception.code, "llm_rate_limited")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(StatusAsyncClient.calls, 3)

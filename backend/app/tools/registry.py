@@ -181,8 +181,12 @@ class ToolRegistry:
         except WorkspaceError as error:
             return ToolResult(False, str(error), "", {})
 
-    def run_command(self, command: str, cwd: str = ".") -> ToolResult:
-        if any(term in command.lower() for term in RISKY_COMMAND_TERMS):
+    @staticmethod
+    def command_requires_approval(command: str) -> bool:
+        return any(term in command.lower() for term in RISKY_COMMAND_TERMS)
+
+    def run_command(self, command: str, cwd: str = ".", approved: bool = False) -> ToolResult:
+        if self.command_requires_approval(command) and not approved:
             return ToolResult(False, "command_requires_approval", "", {"command": command})
         if any(term in command.lower() for term in BACKGROUND_COMMAND_TERMS):
             return ToolResult(False, "background_command_not_allowed", "", {"command": command})
